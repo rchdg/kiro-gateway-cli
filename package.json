@@ -1,0 +1,40 @@
+{
+  "name": "kiro-gateway-cli",
+  "version": "1.0.0",
+  "description": "Node.js CLI gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible proxy server.",
+  "type": "commonjs",
+  "main": "dist/kiro-gateway.js",
+  "bin": {
+    "kiro-gateway": "dist/kiro-gateway.js"
+  },
+  "files": [
+    "dist/kiro-gateway.js",
+    "README.md",
+    "README_EN.md"
+  ],
+  "scripts": {
+    "build": "esbuild bin/kiro-gateway.js --bundle --platform=node --format=cjs --target=node23 --minify --legal-comments=none --outfile=dist/kiro-gateway.js",
+    "prepack": "npm run build",
+    "start": "node bin/kiro-gateway.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=23.4.0"
+  },
+  "keywords": [
+    "kiro",
+    "amazon-q",
+    "codewhisperer",
+    "gateway",
+    "openai",
+    "anthropic",
+    "proxy"
+  ],
+  "license": "AGPL-3.0",
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "express": "^4.21.2",
+    "socks-proxy-agent": "^10.1.0",
+    "undici": "^6.21.0"
+  }
+}

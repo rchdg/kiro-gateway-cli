@@ -1,0 +1,503 @@
+'use strict';
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  parseKiroStream,
+  collectStreamToResult,
+  FirstTokenTimeoutError,
+} = require('../src/streaming/core');
+const {
+  streamKiroToOpenAI,
+  collectStreamResponse,
+  streamWithFirstTokenRetryOpenAI,
+} = require('../src/streaming/openai');
+const {
+  streamKiroToAnthropic,
+  collectAnthropicResponse,
+} = require('../src/streaming/anthropic');
+const { ModelInfoCache } = require('../src/cache');
+const { KiroAuthManager } = require('../src/auth');
+
+// ==================================================================================================
+// Test helpers
+// ==================================================================================================
+
+/**
+ * Builds a fake response body (async iterable of Uint8Array).
+ *
+ * @param {string[]} chunks - Text chunks
+ * @returns {object} Fake response
+ */
+function makeResponse(chunks) {
+  const body = {
+    [Symbol.asyncIterator]: async function* () {
+      for (const chunk of chunks) {
+        yield Buffer.from(chunk, 'utf8');
+      }
+    },
+  };
+  return { statusCode: 200, body };
+}
+
+/**
+ * Builds an AWS event stream chunk string.
+ *
+ * @param {object[]} events - JSON events
+ * @returns {string} Combined chunk
+ */
+function buildEventChunk(events) {
+  return events
+    .map((event) => `:message-type:event\n:event-type:test\n${JSON.stringify(event)}\n\n`)
+    .join('');
+}
+
+function makeModelCache() {
+  const cache = new ModelInfoCache();
+  cache.update([{ modelId: 'claude-sonnet-4.5', tokenLimits: { maxInputTokens: 200000 } }]);
+  return cache;
+}
+
+function makeDummyAuth() {
+  return { fingerprint: 'test-fingerprint' };
+}
+
+// ==================================================================================================
+// parseKiroStream
+// ==================================================================================================
+
+test('parseKiroStream: yields content events', async () => {
+  const response = makeResponse([buildEventChunk([{ content: 'Hello' }, { content: ' world' }])]);
+
+  const events = [];
+  for await (const event of parseKiroStream(response)) {
+    events.push(event);
+  }
+
+  const content = events.filter((e) => e.type === 'content').map((e) => e.content).join('');
+  assert.equal(content, 'Hello world');
+});
+
+test('parseKiroStream: first token timeout raises', async () => {
+  // Body that never yields
+  const body = {
+    [Symbol.asyncIterator]: async function* () {
+      await new Promise(() => {}); // Hang forever
+    },
+  };
+  const response = { body };
+
+  await assert.rejects(
+    (async () => {
+      for await (const _event of parseKiroStream(response, { firstTokenTimeout: 0.1 })) {
+        // Never reached
+      }
+    })(),
+    FirstTokenTimeoutError
+  );
+});
+
+test('parseKiroStream: empty response ends cleanly', async () => {
+  const response = makeResponse([]);
+  const events = [];
+  for await (const event of parseKiroStream(response)) {
+    events.push(event);
+  }
+  assert.equal(events.length, 0);
+});
+
+test('parseKiroStream: extracts tool calls', async () => {
+  const response = makeResponse([
+    buildEventChunk([
+      { name: 'get_weather', toolUseId: 'toolu_1', input: {} },
+      { input: '{"city": "Paris"}' },
+      { stop: true },
+    ]),
+  ]);
+
+  const events = [];
+  for await (const event of parseKiroStream(response)) {
+    events.push(event);
+  }
+
+  const toolEvents = events.filter((e) => e.type === 'tool_use');
+  assert.equal(toolEvents.length, 1);
+  assert.equal(toolEvents[0].toolUse.function.name, 'get_weather');
+});
+
+test('parseKiroStream: thinking block split across chunks', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: '<think' }]),
+    buildEventChunk([{ content: 'ing>secret reasoning' }]),
+    buildEventChunk([{ content: '</thinking>final answer' }]),
+  ]);
+
+  const events = [];
+  for await (const event of parseKiroStream(response)) {
+    events.push(event);
+  }
+
+  const thinking = events.filter((e) => e.type === 'thinking').map((e) => e.thinkingContent).join('');
+  assert.equal(thinking, 'secret reasoning');
+
+  const content = events.filter((e) => e.type === 'content').map((e) => e.content).join('');
+  assert.equal(content, 'final answer');
+});
+
+// ==================================================================================================
+// collectStreamToResult
+// ==================================================================================================
+
+test('collectStreamToResult: accumulates content, usage and context usage', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: 'Hello' }, { usage: 42 }, { contextUsagePercentage: 30 }]),
+  ]);
+
+  const result = await collectStreamToResult(response);
+  assert.equal(result.content, 'Hello');
+  assert.equal(result.usage, 42);
+  assert.equal(result.contextUsagePercentage, 30);
+});
+
+// ==================================================================================================
+// streamKiroToOpenAI
+// ==================================================================================================
+
+test('streamKiroToOpenAI: emits content chunks and [DONE]', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: 'Hello' }, { content: ' world' }, { contextUsagePercentage: 10 }]),
+  ]);
+
+  const chunks = [];
+  for await (const chunk of streamKiroToOpenAI(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+  })) {
+    chunks.push(chunk);
+  }
+
+  assert.ok(chunks.length >= 3);
+  assert.ok(chunks[chunks.length - 1] === 'data: [DONE]\n\n');
+
+  // First chunk should have the assistant role
+  const first = JSON.parse(chunks[0].slice('data:'.length).trim());
+  assert.equal(first.object, 'chat.completion.chunk');
+  assert.equal(first.model, 'claude-sonnet-4.5');
+  assert.equal(first.choices[0].delta.role, 'assistant');
+  assert.equal(first.choices[0].delta.content, 'Hello');
+
+  // Last data chunk should have usage
+  const last = JSON.parse(chunks[chunks.length - 2].slice('data:'.length).trim());
+  assert.ok(last.usage.prompt_tokens > 0);
+  assert.equal(last.choices[0].finish_reason, 'stop');
+});
+
+test('streamKiroToOpenAI: emits reasoning_content for thinking blocks', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: '<thinking>deep</thinking>answer' }]),
+  ]);
+
+  const chunks = [];
+  for await (const chunk of streamKiroToOpenAI(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+  })) {
+    chunks.push(chunk);
+  }
+
+  const parsed = chunks.map((c) => {
+    const data = c.slice('data:'.length).trim();
+    return data === '[DONE]' ? null : JSON.parse(data);
+  });
+
+  const reasoningChunks = parsed.filter((c) => c && c.choices[0].delta.reasoning_content);
+  assert.equal(reasoningChunks.length, 1);
+  assert.equal(reasoningChunks[0].choices[0].delta.reasoning_content, 'deep');
+
+  const contentChunks = parsed.filter((c) => c && c.choices[0].delta.content);
+  assert.equal(contentChunks.length, 1);
+  assert.equal(contentChunks[0].choices[0].delta.content, 'answer');
+});
+
+test('streamKiroToOpenAI: emits tool_calls with finish_reason tool_calls', async () => {
+  const response = makeResponse([
+    buildEventChunk([
+      { name: 'bash', toolUseId: 'toolu_1', input: {} },
+      { input: '{"command": "ls"}' },
+      { stop: true },
+      { contextUsagePercentage: 10 },
+    ]),
+  ]);
+
+  const chunks = [];
+  for await (const chunk of streamKiroToOpenAI(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+  })) {
+    chunks.push(chunk);
+  }
+
+  const parsed = chunks.map((c) => {
+    const data = c.slice('data:'.length).trim();
+    return data === '[DONE]' ? null : JSON.parse(data);
+  });
+
+  const toolChunk = parsed.find((c) => c && c.choices[0].delta.tool_calls);
+  assert.ok(toolChunk, 'expected a tool_calls chunk');
+  assert.equal(toolChunk.choices[0].delta.tool_calls[0].function.name, 'bash');
+  assert.equal(toolChunk.choices[0].delta.tool_calls[0].index, 0);
+
+  const finalChunk = parsed.filter(Boolean).pop();
+  assert.equal(finalChunk.choices[0].finish_reason, 'tool_calls');
+});
+
+// ==================================================================================================
+// collectStreamResponse (non-streaming)
+// ==================================================================================================
+
+test('collectStreamResponse: forms full chat completion', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: 'The answer is ' }, { content: '42' }, { contextUsagePercentage: 10 }]),
+  ]);
+
+  const result = await collectStreamResponse(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    requestMessages: [{ role: 'user', content: 'What is 6*7?' }],
+  });
+
+  assert.equal(result.object, 'chat.completion');
+  assert.equal(result.choices[0].message.role, 'assistant');
+  assert.equal(result.choices[0].message.content, 'The answer is 42');
+  assert.equal(result.choices[0].finish_reason, 'stop');
+  assert.ok(result.usage.total_tokens > 0);
+});
+
+test('collectStreamResponse: includes reasoning_content', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: '<thinking>reasoning</thinking>conclusion' }]),
+  ]);
+
+  const result = await collectStreamResponse(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+  });
+
+  assert.equal(result.choices[0].message.reasoning_content, 'reasoning');
+  assert.equal(result.choices[0].message.content, 'conclusion');
+});
+
+// ==================================================================================================
+// streamKiroToAnthropic
+// ==================================================================================================
+
+test('streamKiroToAnthropic: full SSE sequence', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: 'Hello' }, { content: ' world' }, { contextUsagePercentage: 10 }]),
+  ]);
+
+  const chunks = [];
+  for await (const chunk of streamKiroToAnthropic(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+    requestMessages: [{ role: 'user', content: 'Say hello' }],
+  })) {
+    chunks.push(chunk);
+  }
+
+  const events = chunks.map((c) => {
+    const eventLine = c.split('\n')[0];
+    return eventLine.replace('event: ', '');
+  });
+
+  assert.deepEqual(events, [
+    'message_start',
+    'content_block_start',
+    'content_block_delta',
+    'content_block_delta',
+    'content_block_stop',
+    'message_delta',
+    'message_stop',
+  ]);
+
+  const startEvent = JSON.parse(chunks[0].split('\n')[1].replace('data: ', ''));
+  assert.equal(startEvent.type, 'message_start');
+  assert.equal(startEvent.message.model, 'claude-sonnet-4.5');
+  assert.ok(startEvent.message.usage.input_tokens > 0);
+
+  const deltaEvent = JSON.parse(chunks[2].split('\n')[1].replace('data: ', ''));
+  assert.equal(deltaEvent.delta.type, 'text_delta');
+  assert.equal(deltaEvent.delta.text, 'Hello');
+
+  const deltaEvent2 = JSON.parse(chunks[3].split('\n')[1].replace('data: ', ''));
+  assert.equal(deltaEvent2.delta.text, ' world');
+
+  const messageDelta = JSON.parse(chunks[5].split('\n')[1].replace('data: ', ''));
+  assert.equal(messageDelta.delta.stop_reason, 'end_turn');
+  assert.ok(messageDelta.usage.output_tokens > 0);
+});
+
+test('streamKiroToAnthropic: tool_use block sequence', async () => {
+  const response = makeResponse([
+    buildEventChunk([
+      { name: 'bash', toolUseId: 'toolu_x', input: {} },
+      { input: '{"cmd": "pwd"}' },
+      { stop: true },
+      { contextUsagePercentage: 10 },
+    ]),
+  ]);
+
+  const chunks = [];
+  for await (const chunk of streamKiroToAnthropic(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+  })) {
+    chunks.push(chunk);
+  }
+
+  const events = chunks.map((c) => c.split('\n')[0].replace('event: ', ''));
+  assert.deepEqual(events, [
+    'message_start',
+    'content_block_start',
+    'content_block_delta',
+    'content_block_stop',
+    'message_delta',
+    'message_stop',
+  ]);
+
+  const toolStart = JSON.parse(chunks[1].split('\n')[1].replace('data: ', ''));
+  assert.equal(toolStart.content_block.type, 'tool_use');
+  assert.equal(toolStart.content_block.name, 'bash');
+  assert.equal(toolStart.content_block.id, 'toolu_x');
+
+  const toolDelta = JSON.parse(chunks[2].split('\n')[1].replace('data: ', ''));
+  assert.equal(toolDelta.delta.type, 'input_json_delta');
+  assert.equal(JSON.parse(toolDelta.delta.partial_json).cmd, 'pwd');
+
+  const messageDelta = JSON.parse(chunks[4].split('\n')[1].replace('data: ', ''));
+  assert.equal(messageDelta.delta.stop_reason, 'tool_use');
+});
+
+test('collectAnthropicResponse: forms full message', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ content: 'Hello there' }, { contextUsagePercentage: 10 }]),
+  ]);
+
+  const result = await collectAnthropicResponse(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    requestMessages: [{ role: 'user', content: 'Hi' }],
+  });
+
+  assert.equal(result.type, 'message');
+  assert.equal(result.role, 'assistant');
+  assert.equal(result.content[0].type, 'text');
+  assert.equal(result.content[0].text, 'Hello there');
+  assert.equal(result.stop_reason, 'end_turn');
+  assert.ok(result.usage.input_tokens > 0);
+  assert.ok(result.usage.output_tokens > 0);
+});
+
+// ==================================================================================================
+// streamWithFirstTokenRetryOpenAI
+// ==================================================================================================
+
+test('streamWithFirstTokenRetryOpenAI: retries on first token timeout', async () => {
+  let requestCount = 0;
+
+  async function makeRequest() {
+    requestCount += 1;
+    if (requestCount === 1) {
+      // First attempt: hangs (timeout)
+      return {
+        statusCode: 200,
+        body: {
+          [Symbol.asyncIterator]: async function* () {
+            await new Promise(() => {});
+          },
+        },
+      };
+    }
+    // Second attempt: responds normally
+    return makeResponse([buildEventChunk([{ content: 'recovered' }, { contextUsagePercentage: 10 }])]);
+  }
+
+  const chunks = [];
+  for await (const chunk of streamWithFirstTokenRetryOpenAI({
+    makeRequest,
+    initialResponse: await makeRequest(),
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    firstTokenTimeout: 0.1,
+    maxRetries: 3,
+  })) {
+    chunks.push(chunk);
+  }
+
+  assert.ok(requestCount >= 2, `expected retries, got ${requestCount} requests`);
+  assert.ok(chunks.some((c) => c.includes('recovered')));
+  assert.ok(chunks[chunks.length - 1] === 'data: [DONE]\n\n');
+});
+
+test('streamWithFirstTokenRetryOpenAI: exhausts retries and raises', async () => {
+  let requestCount = 0;
+
+  async function makeRequest() {
+    requestCount += 1;
+    return {
+      statusCode: 200,
+      body: {
+        [Symbol.asyncIterator]: async function* () {
+          await new Promise(() => {});
+        },
+      },
+    };
+  }
+
+  await assert.rejects(
+    (async () => {
+      for await (const _chunk of streamWithFirstTokenRetryOpenAI({
+        makeRequest,
+        initialResponse: await makeRequest(),
+        model: 'claude-sonnet-4.5',
+        modelCache: makeModelCache(),
+        firstTokenTimeout: 0.1,
+        maxRetries: 2,
+      })) {
+        // Never reached
+      }
+    })(),
+    /did not respond/
+  );
+
+  assert.equal(requestCount, 2);
+});
+
+test('streamWithFirstTokenRetryOpenAI: propagates upstream HTTP errors', async () => {
+  async function makeRequest() {
+    return {
+      statusCode: 400,
+      body: makeResponse(['bad request']).body,
+    };
+  }
+
+  await assert.rejects(
+    (async () => {
+      for await (const _chunk of streamWithFirstTokenRetryOpenAI({
+        makeRequest,
+        model: 'claude-sonnet-4.5',
+        modelCache: makeModelCache(),
+        firstTokenTimeout: 0.1,
+      })) {
+        // Never reached
+      }
+    })(),
+    /Upstream API error/
+  );
+});
