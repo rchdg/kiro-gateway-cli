@@ -130,6 +130,18 @@ class KiroAuthManager {
 
     this._detectAuthType();
 
+    // Fallback: discover the profile ARN from the Kiro IDE profile file
+    // when no credential source (credentials.json, token file, SQLite state
+    // table) provided one. This keeps the gateway working when credentials.json
+    // is not shipped (e.g. published releases where the file is gitignored).
+    if (!this._profileArn) {
+      const discoveredArn = discoverKiroIdeProfileArn();
+      if (discoveredArn) {
+        this._profileArn = discoveredArn;
+        logger.info(`Profile ARN discovered from Kiro IDE: ${discoveredArn}`);
+      }
+    }
+
     // Determine the final API region with priority:
     // 1. Explicit apiRegion parameter - HIGHEST
     // 2. KIRO_API_REGION env var (global override)
@@ -786,6 +798,61 @@ async function readBodyText(body) {
   }
 }
 
+/**
+ * Returns the platform-specific path to the Kiro IDE profile file.
+ *
+ * Kiro IDE (a VS Code fork) stores the active profile ARN in its
+ * globalStorage directory following the VS Code layout:
+ *
+ * - macOS:   ~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/profile.json
+ * - Windows: %APPDATA%/Kiro/User/globalStorage/kiro.kiroagent/profile.json
+ * - Linux:   ~/.config/Kiro/User/globalStorage/kiro.kiroagent/profile.json
+ *
+ * @param {string} [platform=process.platform] - Target platform
+ * @returns {string|null} Path to the profile file or null if unsupported
+ */
+function getKiroIdeProfilePath(platform = process.platform) {
+  const extensionDir = path.join('User', 'globalStorage', 'kiro.kiroagent', 'profile.json');
+
+  if (platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'Kiro', extensionDir);
+  }
+  if (platform === 'win32') {
+    const appData = process.env.APPDATA;
+    return appData ? path.join(appData, 'Kiro', extensionDir) : null;
+  }
+  if (platform === 'linux') {
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+    return path.join(configHome, 'Kiro', extensionDir);
+  }
+  return null;
+}
+
+/**
+ * Discovers the profile ARN from the Kiro IDE profile file.
+ *
+ * The profile file contains {"arn": "arn:aws:codewhisperer:...", "name": "..."}.
+ * Missing files, malformed JSON, and missing/empty arn fields all return null
+ * so the caller can fall back gracefully.
+ *
+ * @param {string|null} [profilePath] - Explicit path (defaults to the platform path)
+ * @returns {string|null} Profile ARN or null if unavailable
+ */
+function discoverKiroIdeProfileArn(profilePath = null) {
+  const resolvedPath = profilePath || getKiroIdeProfilePath();
+  if (!resolvedPath) return null;
+
+  try {
+    if (!fs.existsSync(resolvedPath)) return null;
+    const data = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+    if (!data || typeof data !== 'object') return null;
+    const arn = data.arn;
+    return typeof arn === 'string' && arn.length > 0 ? arn : null;
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   AuthType,
   KiroAuthManager,
@@ -793,4 +860,6 @@ module.exports = {
   SQLITE_REGISTRATION_KEYS,
   parseExpiresAt,
   readBodyText,
+  getKiroIdeProfilePath,
+  discoverKiroIdeProfileArn,
 };

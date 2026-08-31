@@ -8,7 +8,12 @@ const path = require('node:path');
 
 // Mock undici.request BEFORE requiring the auth module
 const undici = require('undici');
-const { KiroAuthManager, parseExpiresAt } = require('../src/auth');
+const {
+  KiroAuthManager,
+  parseExpiresAt,
+  getKiroIdeProfilePath,
+  discoverKiroIdeProfileArn,
+} = require('../src/auth');
 const { KiroHttpClient } = require('../src/httpClient');
 
 // ==================================================================================================
@@ -65,6 +70,188 @@ test('KiroAuthManager: api_region override takes priority', () => {
 
   const auth = new KiroAuthManager({ credsFile, apiRegion: 'eu-central-1' });
   assert.equal(auth.apiHost, 'https://runtime.eu-central-1.kiro.dev');
+});
+
+// ==================================================================================================
+// Kiro IDE profile ARN discovery
+// ==================================================================================================
+
+test('getKiroIdeProfilePath: darwin path', () => {
+  const p = getKiroIdeProfilePath('darwin');
+  assert.equal(
+    p,
+    path.join(os.homedir(), 'Library', 'Application Support', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent', 'profile.json')
+  );
+});
+
+test('getKiroIdeProfilePath: win32 path uses APPDATA', () => {
+  const prevAppData = process.env.APPDATA;
+  process.env.APPDATA = 'C:\\Users\\test\\AppData\\Roaming';
+  try {
+    const p = getKiroIdeProfilePath('win32');
+    assert.equal(
+      p,
+      path.join('C:\\Users\\test\\AppData\\Roaming', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent', 'profile.json')
+    );
+  } finally {
+    if (prevAppData === undefined) {
+      delete process.env.APPDATA;
+    } else {
+      process.env.APPDATA = prevAppData;
+    }
+  }
+});
+
+test('getKiroIdeProfilePath: win32 returns null without APPDATA', () => {
+  const prevAppData = process.env.APPDATA;
+  delete process.env.APPDATA;
+  try {
+    assert.equal(getKiroIdeProfilePath('win32'), null);
+  } finally {
+    if (prevAppData !== undefined) process.env.APPDATA = prevAppData;
+  }
+});
+
+test('getKiroIdeProfilePath: linux path uses XDG_CONFIG_HOME', () => {
+  const prevConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = '/custom/config';
+  try {
+    const p = getKiroIdeProfilePath('linux');
+    assert.equal(
+      p,
+      path.join('/custom/config', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent', 'profile.json')
+    );
+  } finally {
+    if (prevConfigHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevConfigHome;
+    }
+  }
+});
+
+test('getKiroIdeProfilePath: linux falls back to ~/.config', () => {
+  const prevConfigHome = process.env.XDG_CONFIG_HOME;
+  delete process.env.XDG_CONFIG_HOME;
+  try {
+    const p = getKiroIdeProfilePath('linux');
+    assert.equal(
+      p,
+      path.join(os.homedir(), '.config', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent', 'profile.json')
+    );
+  } finally {
+    if (prevConfigHome !== undefined) process.env.XDG_CONFIG_HOME = prevConfigHome;
+  }
+});
+
+test('getKiroIdeProfilePath: unsupported platform returns null', () => {
+  assert.equal(getKiroIdeProfilePath('freebsd'), null);
+});
+
+test('discoverKiroIdeProfileArn: returns arn from a valid profile file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const profileFile = path.join(dir, 'profile.json');
+  fs.writeFileSync(
+    profileFile,
+    JSON.stringify({ arn: 'arn:aws:codewhisperer:us-east-1:123:profile/id', name: 'Profile' })
+  );
+
+  assert.equal(
+    discoverKiroIdeProfileArn(profileFile),
+    'arn:aws:codewhisperer:us-east-1:123:profile/id'
+  );
+});
+
+test('discoverKiroIdeProfileArn: missing file returns null', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  assert.equal(discoverKiroIdeProfileArn(path.join(dir, 'does-not-exist.json')), null);
+});
+
+test('discoverKiroIdeProfileArn: malformed JSON returns null', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const profileFile = path.join(dir, 'profile.json');
+  fs.writeFileSync(profileFile, '{not valid json');
+
+  assert.equal(discoverKiroIdeProfileArn(profileFile), null);
+});
+
+test('discoverKiroIdeProfileArn: empty arn field returns null', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const profileFile = path.join(dir, 'profile.json');
+  fs.writeFileSync(profileFile, JSON.stringify({ arn: '', name: 'Profile' }));
+
+  assert.equal(discoverKiroIdeProfileArn(profileFile), null);
+});
+
+test('discoverKiroIdeProfileArn: missing arn field returns null', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const profileFile = path.join(dir, 'profile.json');
+  fs.writeFileSync(profileFile, JSON.stringify({ name: 'Profile' }));
+
+  assert.equal(discoverKiroIdeProfileArn(profileFile), null);
+});
+
+test('discoverKiroIdeProfileArn: non-string arn returns null', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const profileFile = path.join(dir, 'profile.json');
+  fs.writeFileSync(profileFile, JSON.stringify({ arn: 123 }));
+
+  assert.equal(discoverKiroIdeProfileArn(profileFile), null);
+});
+
+test('KiroAuthManager: discovers profileArn from Kiro IDE when credentials lack it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const credsFile = path.join(dir, 'credentials.json');
+  fs.writeFileSync(credsFile, JSON.stringify({ refreshToken: 'rt', region: 'us-east-1' }));
+
+  // Point the platform path resolution at the temp dir
+  const origHomedir = os.homedir;
+  os.homedir = () => dir;
+  const profileFile = getKiroIdeProfilePath('darwin');
+
+  try {
+    fs.mkdirSync(path.dirname(profileFile), { recursive: true });
+    fs.writeFileSync(
+      profileFile,
+      JSON.stringify({ arn: 'arn:aws:codewhisperer:us-east-1:123:profile/discovered', name: 'Profile' })
+    );
+
+    const auth = new KiroAuthManager({ credsFile });
+    assert.equal(auth.profileArn, 'arn:aws:codewhisperer:us-east-1:123:profile/discovered');
+  } finally {
+    os.homedir = origHomedir;
+  }
+});
+
+test('KiroAuthManager: explicit profileArn takes priority over Kiro IDE discovery', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const credsFile = path.join(dir, 'credentials.json');
+  fs.writeFileSync(
+    credsFile,
+    JSON.stringify({
+      refreshToken: 'rt',
+      region: 'us-east-1',
+      profileArn: 'arn:aws:codewhisperer:us-east-1:123:profile/explicit',
+    })
+  );
+
+  // Point the platform path resolution at the temp dir
+  const origHomedir = os.homedir;
+  os.homedir = () => dir;
+  const profileFile = getKiroIdeProfilePath('darwin');
+
+  try {
+    fs.mkdirSync(path.dirname(profileFile), { recursive: true });
+    fs.writeFileSync(
+      profileFile,
+      JSON.stringify({ arn: 'arn:aws:codewhisperer:us-east-1:123:profile/discovered', name: 'Profile' })
+    );
+
+    const auth = new KiroAuthManager({ credsFile });
+    assert.equal(auth.profileArn, 'arn:aws:codewhisperer:us-east-1:123:profile/explicit');
+  } finally {
+    os.homedir = origHomedir;
+  }
 });
 
 test('KiroAuthManager: getAccessToken returns valid cached token without network', async () => {

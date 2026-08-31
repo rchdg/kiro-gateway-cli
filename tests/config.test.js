@@ -70,3 +70,15 @@ test('config: PROXY_API_KEY respects an explicit env var', () => {
   const config = loadConfigWithEnv({ PROXY_API_KEY: 'my-secret-key' });
   assert.equal(config.PROXY_API_KEY, 'my-secret-key');
 });
+
+test('config: KIRO_PID_FILE and KIRO_LOG_FILE use defaults', () => {
+  const config = loadConfigWithEnv({ KIRO_PID_FILE: null, KIRO_LOG_FILE: null });
+  assert.equal(config.KIRO_PID_FILE, '.kiro-gateway.pid');
+  assert.equal(config.KIRO_LOG_FILE, 'kiro-gateway.log');
+});
+
+test('config: KIRO_PID_FILE and KIRO_LOG_FILE respect env vars', () => {
+  const config = loadConfigWithEnv({ KIRO_PID_FILE: '/tmp/gw.pid', KIRO_LOG_FILE: '/tmp/gw.log' });
+  assert.equal(config.KIRO_PID_FILE, '/tmp/gw.pid');
+  assert.equal(config.KIRO_LOG_FILE, '/tmp/gw.log');
+});

@@ -33,6 +33,13 @@ kiro-gateway serve --host 127.0.0.1 --port 9000
 node bin/kiro-gateway.js serve --port 9000
 node bin/kiro-gateway.js --host 127.0.0.1 --port 9000
 
+# Run in the background (daemon) - returns immediately
+kiro-gateway serve --background
+kiro-gateway serve -b --port 9000
+
+# Stop the background server (run from the same directory)
+kiro-gateway stop
+
 # Global install (adds the `kiro-gateway` command)
 npm link
 kiro-gateway serve --port 9000
@@ -70,6 +77,44 @@ Configuration priority (highest to lowest):
 The `serve` subcommand is optional - running `kiro-gateway` with no arguments
 starts the server the same way.
 
+### Running in the background
+
+`serve --background` (or `-b`) starts the server as a detached daemon and
+returns immediately. The parent waits for the server to become healthy
+(health endpoint) and prints the result.
+
+```bash
+kiro-gateway serve --background --port 9000
+# Starting server in the background (pid 12345)...
+# Server is running in the background: http://127.0.0.1:9000/health
+# Stop it with: kiro-gateway stop
+
+kiro-gateway stop
+# Background server stopped (pid 12345).
+```
+
+Daemon state files (relative to the working directory, so `stop` must be run
+from the same directory as `serve --background`):
+
+- `.kiro-gateway.pid` - PID of the background server (override: `KIRO_PID_FILE`)
+- `kiro-gateway.log` - daemon output (override: `KIRO_LOG_FILE`)
+
+Before starting, the CLI checks that the target port is free and aborts with
+an actionable message when another service is already listening there. If the
+background server exits during startup (bad credentials, port conflict), the
+CLI reports the failure and shows the last log lines.
+
+### Platform notes (Windows)
+
+The daemon works on Windows too: the child is spawned without a console
+window (`windowsHide`) and redirects its output to the log file itself
+(Win32 cannot inherit arbitrary file descriptors via `stdio`). One caveat:
+Windows has no POSIX signals, so `kiro-gateway stop` terminates the
+background process directly instead of triggering its graceful shutdown
+handler. The pid file is still cleaned up by `stop`, and ungraceful
+termination is safe because the pid file is validated against the process
+state on every `start`/`stop`.
+
 ## Configuration
 
 Copy the root `.env.example` to `.env` (next to `kiro-gateway-cli`) or use
@@ -87,6 +132,8 @@ environment variables:
 | `SERVER_HOST` / `SERVER_PORT` | Server binding |
 | `VPN_PROXY_URL` | Proxy for restricted networks: HTTP/HTTPS or SOCKS (`socks5://`, `socks5h://` for proxy-side DNS, `socks4a://`) |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
+| `KIRO_PID_FILE` | PID file for `--background` mode (default: `.kiro-gateway.pid`) |
+| `KIRO_LOG_FILE` | Log file for `--background` mode (default: `kiro-gateway.log`) |
 | `ACCOUNT_SYSTEM` | Enable multi-account failover (`true`/`false`) |
 | `FAKE_REASONING` | Extended thinking via tag injection (default: enabled) |
 | `FIRST_TOKEN_TIMEOUT` | First-token wait before retry (default: 15s) |

@@ -227,6 +227,17 @@ const ACCOUNT_PROBABILISTIC_RETRY_CHANCE = envFloat('ACCOUNT_PROBABILISTIC_RETRY
 const ACCOUNT_CACHE_TTL = envInt('ACCOUNT_CACHE_TTL', 43200);
 
 // ==================================================================================================
+// Background Daemon Settings
+// ==================================================================================================
+
+// PID file records the background server process so `kiro-gateway stop`
+// knows what to terminate. The log file captures the daemon's output. Both
+// paths are resolved relative to the working directory, so `stop` must be
+// run from the same directory used for `serve --background`.
+const KIRO_PID_FILE = envStr('KIRO_PID_FILE', '.kiro-gateway.pid');
+const KIRO_LOG_FILE = envStr('KIRO_LOG_FILE', 'kiro-gateway.log');
+
+// ==================================================================================================
 // Logging
 // ==================================================================================================
 
@@ -304,6 +315,8 @@ module.exports = {
   ACCOUNT_MAX_BACKOFF_MULTIPLIER,
   ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
   ACCOUNT_CACHE_TTL,
+  KIRO_PID_FILE,
+  KIRO_LOG_FILE,
   LOG_LEVEL,
   APP_VERSION,
   APP_TITLE,

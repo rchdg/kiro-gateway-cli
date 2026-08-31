@@ -28,7 +28,13 @@ test('splitCommand: flag-first arguments are not treated as a command', () => {
 });
 
 test('splitCommand: unknown command raises CliError', () => {
-  assert.throws(() => splitCommand(['stop']), CliError);
+  assert.throws(() => splitCommand(['restart']), CliError);
+});
+
+test('splitCommand: stop subcommand is extracted', () => {
+  const { command, args } = splitCommand(['stop']);
+  assert.equal(command, 'stop');
+  assert.deepEqual(args, []);
 });
 
 test('parseCliArgs: no arguments returns defaults', () => {
@@ -38,6 +44,7 @@ test('parseCliArgs: no arguments returns defaults', () => {
   assert.deepEqual(args.overrides, {});
   assert.equal(args.help, false);
   assert.equal(args.version, false);
+  assert.equal(args.background, false);
 });
 
 test('parseCliArgs: host and port', () => {
@@ -94,6 +101,19 @@ test('parseCliArgs: help and version flags', () => {
   assert.equal(parseCliArgs(['-v']).version, true);
 });
 
+test('parseCliArgs: background flag enables daemon mode', () => {
+  assert.equal(parseCliArgs(['--background']).background, true);
+  assert.equal(parseCliArgs(['-b']).background, true);
+  assert.equal(parseCliArgs(['-b', '--port', '9000']).background, true);
+  assert.equal(parseCliArgs(['--port', '9000']).background, false);
+});
+
+test('parseCliArgs: background flag does not set env overrides', () => {
+  const args = parseCliArgs(['--background', '--log-level', 'DEBUG']);
+  assert.equal(args.background, true);
+  assert.deepEqual(args.overrides, { LOG_LEVEL: 'DEBUG' });
+});
+
 test('parseCliArgs: unknown flag raises CliError', () => {
   assert.throws(() => parseCliArgs(['--bogus']), CliError);
   assert.throws(() => parseCliArgs(['-x']), CliError);
@@ -116,7 +136,10 @@ test('parseCliArgs: last flag wins for repeated options', () => {
 test('buildHelpText: documents all common options', () => {
   const help = buildHelpText('Test Gateway', '1.0.0', 'description');
   assert.ok(help.includes('serve'));
+  assert.ok(help.includes('stop'));
   assert.ok(help.includes('Usage: kiro-gateway [serve] [options]'));
+  assert.ok(help.includes('kiro-gateway stop'));
+  assert.ok(help.includes('--background'));
   assert.ok(help.includes('--api-key'));
   assert.ok(help.includes('--refresh-token'));
   assert.ok(help.includes('--creds-file'));

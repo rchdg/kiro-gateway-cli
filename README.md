@@ -31,6 +31,13 @@ kiro-gateway serve --host 127.0.0.1 --port 9000
 node bin/kiro-gateway.js serve --port 9000
 node bin/kiro-gateway.js --host 127.0.0.1 --port 9000
 
+# 后台运行（守护进程）——立即返回
+kiro-gateway serve --background
+kiro-gateway serve -b --port 9000
+
+# 停止后台服务器（需在同一个目录下运行）
+kiro-gateway stop
+
 # 全局安装（添加 kiro-gateway 命令）
 npm link
 kiro-gateway serve --port 9000
@@ -66,6 +73,31 @@ kiro-gateway serve \
 
 `serve` 子命令是可选的——直接运行 `kiro-gateway`（不带参数）也会以相同方式启动服务器。
 
+### 后台运行
+
+`serve --background`（或 `-b`）会把服务器作为分离的守护进程启动，然后立即返回。父进程会等待服务器健康检查通过（/health 端点）并打印结果。
+
+```bash
+kiro-gateway serve --background --port 9000
+# Starting server in the background (pid 12345)...
+# Server is running in the background: http://127.0.0.1:9000/health
+# Stop it with: kiro-gateway stop
+
+kiro-gateway stop
+# Background server stopped (pid 12345).
+```
+
+守护进程状态文件（相对于工作目录，所以 `stop` 必须在启动 `serve --background` 的同一个目录下运行）：
+
+- `.kiro-gateway.pid` - 后台服务器的 PID（可用 `KIRO_PID_FILE` 覆盖）
+- `kiro-gateway.log` - 守护进程输出日志（可用 `KIRO_LOG_FILE` 覆盖）
+
+启动前 CLI 会检查目标端口是否空闲，如果已有其他服务在监听，会报错并给出可操作的提示。如果后台服务器在启动过程中退出（凭据错误、端口冲突等），CLI 会报告失败并显示日志末尾几行。
+
+### Windows 平台说明
+
+后台运行在 Windows 上同样可用：子进程以无控制台窗口（`windowsHide`）方式启动，并自行把输出重定向到日志文件（Win32 不能通过 `stdio` 继承任意文件描述符）。一个注意点：Windows 没有 POSIX 信号，所以 `kiro-gateway stop` 会直接终止后台进程，而不会触发它的优雅退出处理器。pid 文件仍由 `stop` 清理，且每次 `start`/`stop` 都会校验 pid 文件对应的进程状态，非优雅终止也是安全的。
+
 ## 配置
 
 复制根目录的 `.env.example` 为 `.env`（放在 `kiro-gateway-cli` 旁边），或者使用环境变量：
@@ -82,6 +114,8 @@ kiro-gateway serve \
 | `SERVER_HOST` / `SERVER_PORT` | 服务器监听地址 |
 | `VPN_PROXY_URL` | 受限网络下的代理：HTTP/HTTPS 或 SOCKS（`socks5://`、代理侧 DNS 用 `socks5h://`、`socks4a://`） |
 | `LOG_LEVEL` | `DEBUG`、`INFO`、`WARNING`、`ERROR`（默认：`INFO`） |
+| `KIRO_PID_FILE` | `--background` 模式的 PID 文件（默认：`.kiro-gateway.pid`） |
+| `KIRO_LOG_FILE` | `--background` 模式的日志文件（默认：`kiro-gateway.log`） |
 | `ACCOUNT_SYSTEM` | 启用多账号故障切换（`true`/`false`） |
 | `FAKE_REASONING` | 通过标签注入实现扩展思考（默认：启用） |
 | `FIRST_TOKEN_TIMEOUT` | 重试前等待首个 token 的时间（默认：15 秒） |

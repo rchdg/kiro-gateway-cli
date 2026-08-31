@@ -9,7 +9,7 @@
  */
 
 // Subcommands supported by the CLI
-const COMMANDS = ['serve'];
+const COMMANDS = ['serve', 'stop'];
 
 const FLAG_DEFS = [
   { flags: ['-H', '--host'], env: 'SERVER_HOST', help: 'Server host address' },
@@ -73,7 +73,7 @@ function splitCommand(argv) {
  * Parses CLI arguments.
  *
  * @param {string[]} argv - Arguments (without the node/script prefix)
- * @returns {{host: string|null, port: number|null, overrides: object, help: boolean, version: boolean}}
+ * @returns {{host: string|null, port: number|null, overrides: object, help: boolean, version: boolean, background: boolean}}
  * @throws {CliError} On unknown flags or invalid values
  */
 function parseCliArgs(argv) {
@@ -83,6 +83,7 @@ function parseCliArgs(argv) {
     overrides: {},
     help: false,
     version: false,
+    background: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -94,6 +95,10 @@ function parseCliArgs(argv) {
     }
     if (arg === '-v' || arg === '--version') {
       result.version = true;
+      continue;
+    }
+    if (arg === '-b' || arg === '--background') {
+      result.background = true;
       continue;
     }
 
@@ -148,15 +153,18 @@ function buildHelpText(appTitle, appVersion, appDescription) {
     appDescription,
     '',
     'Usage: kiro-gateway [serve] [options]',
+    '       kiro-gateway stop',
     '',
     'Commands:',
     '  serve                      Start the proxy gateway server (default)',
+    '  stop                       Stop the background server started with --background',
     '',
     'Options:',
     ...FLAG_DEFS.map((def) => {
       const flagNames = def.flags.join(', ');
       return `  ${flagNames.padEnd(26)} ${def.help}`;
     }),
+    '  -b, --background           Run the server in the background (daemon)',
     '  -v, --version              Print version',
     '  -h, --help                 Print help',
     '',
