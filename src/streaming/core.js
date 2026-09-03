@@ -15,6 +15,7 @@
 const { Logger } = require('../logger');
 const { AwsEventStreamParser, parseBracketToolCalls, deduplicateToolCalls } = require('../parsers');
 const { ThinkingParser } = require('../thinkingParser');
+const { classifyNetworkError } = require('../errors');
 const {
   FIRST_TOKEN_TIMEOUT,
   FIRST_TOKEN_MAX_RETRIES,
@@ -372,6 +373,9 @@ async function* streamWithFirstTokenRetry({
   onAllRetriesFailed = null,
 }) {
   let lastError = null;
+  // Set once any chunk has been handed to the consumer: past that point a
+  // mid-stream failure can no longer be retried transparently.
+  let yielded = false;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     let response = null;
@@ -405,27 +409,27 @@ async function* streamWithFirstTokenRetry({
         logger.error(`Error from Kiro API: ${response.statusCode} - ${errorText}`);
 
         if (onHttpError) {
-          throw onHttpError(response.statusCode, errorText);
+          const httpError = onHttpError(response.statusCode, errorText);
+          httpError.isUpstreamHttpError = true;
+          throw httpError;
         }
-        throw new Error(`Upstream API error (${response.statusCode}): ${errorText}`);
+        const fallbackError = new Error(`Upstream API error (${response.statusCode}): ${errorText}`);
+        fallbackError.isUpstreamHttpError = true;
+        throw fallbackError;
       }
 
-      // Stream with the first token timeout handled by the processor
+      // Stream with the first token timeout handled by the processor.
+      // Anything handed to the consumer may already be written to the
+      // client, so only errors before the first chunk are retryable.
       for await (const chunk of streamProcessor(response)) {
+        yielded = true;
         yield chunk;
       }
 
       // Successfully completed
       return;
     } catch (err) {
-      if (err instanceof FirstTokenTimeoutError) {
-        lastError = err;
-        logger.warning(
-          `[FirstTokenTimeout] Attempt ${attempt + 1}/${maxRetries} failed - ` +
-            `model did not respond within ${firstTokenTimeout}s`
-        );
-
-        // Cancel the current response if open
+      const cancelCurrentResponse = async () => {
         if (response) {
           try {
             await cancelBody(response.body);
@@ -433,19 +437,50 @@ async function* streamWithFirstTokenRetry({
             // Already cancelled
           }
         }
+      };
 
+      // AbortError - client disconnected, propagate immediately
+      if (err && (err.name === 'AbortError' || (err.cause && err.cause.code === 'UND_ERR_ABORTED'))) {
+        await cancelCurrentResponse();
+        throw err;
+      }
+
+      if (err instanceof FirstTokenTimeoutError) {
+        lastError = err;
+        logger.warning(
+          `[FirstTokenTimeout] Attempt ${attempt + 1}/${maxRetries} failed - ` +
+            `model did not respond within ${firstTokenTimeout}s`
+        );
+
+        await cancelCurrentResponse();
         continue;
+      }
+
+      // Upstream HTTP errors are deterministic for this request - no retry
+      if (err.isUpstreamHttpError) {
+        await cancelCurrentResponse();
+        throw err;
+      }
+
+      // Retryable network errors (connection resets, proxy blips, ...) are
+      // safe to retry with a fresh connection as long as nothing was sent
+      // to the client yet.
+      if (!yielded) {
+        const errorInfo = classifyNetworkError(err);
+        if (errorInfo.isRetryable) {
+          lastError = err;
+          logger.warning(
+            `${errorInfo.userMessage} before any data was sent - ` +
+              `retrying (attempt ${attempt + 1}/${maxRetries})`
+          );
+          await cancelCurrentResponse();
+          continue;
+        }
       }
 
       // Other errors - no retry, propagate
       logger.error(`Unexpected error during streaming: ${err.message}`);
-      if (response) {
-        try {
-          await cancelBody(response.body);
-        } catch {
-          // Already cancelled
-        }
-      }
+      await cancelCurrentResponse();
       throw err;
     }
   }

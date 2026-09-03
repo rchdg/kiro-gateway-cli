@@ -501,3 +501,75 @@ test('streamWithFirstTokenRetryOpenAI: propagates upstream HTTP errors', async (
     /Upstream API error/
   );
 });
+
+test('streamWithFirstTokenRetryOpenAI: retries connection errors before any data is sent', async () => {
+  let requestCount = 0;
+
+  async function makeRequest() {
+    requestCount += 1;
+    if (requestCount === 1) {
+      // First attempt: the proxy drops the connection mid-response before
+      // any chunk reaches the parser (e.g. "Invalid EOF state").
+      return {
+        statusCode: 200,
+        body: {
+          [Symbol.asyncIterator]: async function* () {
+            throw new Error('Response does not match the HTTP/1.1 protocol (Invalid EOF state)');
+          },
+        },
+      };
+    }
+    // Second attempt: responds normally
+    return makeResponse([buildEventChunk([{ content: 'recovered' }, { contextUsagePercentage: 10 }])]);
+  }
+
+  const chunks = [];
+  for await (const chunk of streamWithFirstTokenRetryOpenAI({
+    makeRequest,
+    initialResponse: await makeRequest(),
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    firstTokenTimeout: 0.5,
+    maxRetries: 3,
+  })) {
+    chunks.push(chunk);
+  }
+
+  assert.ok(requestCount >= 2, `expected retries, got ${requestCount} requests`);
+  assert.ok(chunks.some((c) => c.includes('recovered')));
+  assert.ok(chunks[chunks.length - 1] === 'data: [DONE]\n\n');
+});
+
+test('streamWithFirstTokenRetryOpenAI: does not retry after data reached the client', async () => {
+  let requestCount = 0;
+
+  async function makeRequest() {
+    requestCount += 1;
+    return {
+      statusCode: 200,
+      body: {
+        [Symbol.asyncIterator]: async function* () {
+          yield Buffer.from(buildEventChunk([{ content: 'partial' }]), 'utf8');
+          throw new Error('Response does not match the HTTP/1.1 protocol (Invalid EOF state)');
+        },
+      },
+    };
+  }
+
+  await assert.rejects(
+    (async () => {
+      for await (const _chunk of streamWithFirstTokenRetryOpenAI({
+        makeRequest,
+        model: 'claude-sonnet-4.5',
+        modelCache: makeModelCache(),
+        firstTokenTimeout: 0.5,
+        maxRetries: 3,
+      })) {
+        // Consumer already received data before the failure
+      }
+    })(),
+    /Invalid EOF state/
+  );
+
+  assert.equal(requestCount, 1);
+});

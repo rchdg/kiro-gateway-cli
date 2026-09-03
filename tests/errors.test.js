@@ -110,6 +110,14 @@ test('classifyNetworkError: connection reset', () => {
   assert.equal(info.category, ErrorCategory.CONNECTION_RESET);
 });
 
+test('classifyNetworkError: HTTP/1.1 protocol EOF break is a retryable reset', () => {
+  const info = classifyNetworkError(
+    makeError('Error', 'Response does not match the HTTP/1.1 protocol (Invalid EOF state)')
+  );
+  assert.equal(info.category, ErrorCategory.CONNECTION_RESET);
+  assert.equal(info.isRetryable, true);
+});
+
 test('classifyNetworkError: undici wrapped errors use cause', () => {
   const cause = makeError('Error', 'getaddrinfo ENOTFOUND api.kiro.dev', 'ENOTFOUND');
   const wrapped = new TypeError('fetch failed');

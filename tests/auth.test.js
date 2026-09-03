@@ -410,7 +410,15 @@ test('KiroHttpClient: 429 retries with backoff then returns last response', asyn
   const response = await client.requestWithRetry('POST', 'https://example.com', {});
   assert.equal(response.statusCode, 429);
   assert.equal(callCount, 3); // MAX_RETRIES
-  assert.deepEqual(sleeps, [1, 2, 4]); // exponential backoff
+  // Exponential backoff with ±30% jitter
+  const expectedBase = [1, 2, 4];
+  assert.equal(sleeps.length, expectedBase.length);
+  expectedBase.forEach((base, i) => {
+    assert.ok(
+      sleeps[i] >= base * 0.7 && sleeps[i] <= base * 1.3,
+      `delay ${sleeps[i]} not within jittered range of ${base}`
+    );
+  });
 });
 
 test('KiroHttpClient: 400 errors are returned as-is without retry', async () => {

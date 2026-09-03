@@ -113,7 +113,12 @@ function createSocks5Server({ onRequest } = {}) {
               host = buffer.subarray(offset, offset + len).toString();
               offset += len;
             } else {
-              host = buffer.subarray(offset, offset + 16).toString('hex');
+              // atyp 0x04: expand the 16 address bytes into an IPv6 literal
+              const groups = [];
+              for (let i = 0; i < 16; i += 2) {
+                groups.push(buffer.subarray(offset + i, offset + i + 2).toString('hex'));
+              }
+              host = groups.join(':');
               offset += 16;
             }
             const port = buffer.readUInt16BE(offset);
@@ -173,13 +178,17 @@ function writeReply(socket, rep) {
 /**
  * Starts a server and resolves once it is listening.
  *
+ * Binds without a host so the socket is dual-stack: destination hostnames
+ * such as 'localhost' may resolve to ::1 or 127.0.0.1 depending on the
+ * platform resolver order, and both must reach the server.
+ *
  * @param {import('node:net').Server} server - Server to start
  * @returns {Promise<number>} The bound port
  */
 function listen(server) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+    server.listen(0, () => resolve(server.address().port));
   });
 }
 
@@ -322,10 +331,13 @@ test('SOCKS5: requests tunnel through the proxy with local DNS', async () => {
     await close(originServer);
   }
 
-  // socks5 performs client-side DNS: the proxy receives an IPv4 address.
+  // socks5 performs client-side DNS: the proxy receives a resolved IP
+  // address (v4 or v6, depending on the local resolver order), not the
+  // hostname.
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].host, '127.0.0.1');
-  assert.equal(requests[0].atyp, 0x01);
+  assert.ok(requests[0].atyp === 0x01 || requests[0].atyp === 0x04);
+  assert.notEqual(requests[0].host, 'localhost');
+  assert.match(requests[0].host, /^[0-9a-f:.]+$/);
 });
 
 test('SOCKS5h: unreachable destination surfaces a network error', async () => {
@@ -529,4 +541,30 @@ test('buildSocksConnect: agent rejection surfaces through the callback', async (
   });
 
   assert.equal(err.message, 'socks handshake failed');
+});
+
+test('buildSocksConnect: retries the tunnel once on transient failure', async () => {
+  let attempts = 0;
+  const socket = new FakeTlsSocket();
+  const agent = {
+    connect: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('socks proxy timed out');
+      }
+      return socket;
+    },
+  };
+
+  const connect = buildSocksConnect(agent);
+  const { err, socket: resolved } = await invokeConnect(connect, {
+    hostname: 'localhost',
+    host: 'localhost',
+    protocol: 'http:',
+    port: 80,
+  });
+
+  assert.equal(err, null);
+  assert.equal(resolved, socket);
+  assert.equal(attempts, 2);
 });

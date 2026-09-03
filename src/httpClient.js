@@ -45,6 +45,26 @@ const SOCKS_PROXY_SCHEMES = ['socks:', 'socks4:', 'socks4a:', 'socks5:', 'socks5
 // hang the request forever.
 const SOCKS_TUNNEL_TIMEOUT_MS = 10_000;
 
+// A single fast in-connect retry hides sub-second proxy blips (momentary
+// SOCKS handshake resets) without burning a full HTTP-level attempt.
+const SOCKS_TUNNEL_MAX_ATTEMPTS = 2;
+const SOCKS_TUNNEL_RETRY_DELAY_MS = 250;
+
+// Relative jitter applied to exponential backoff so parallel failing
+// requests do not retry in lockstep while the network is recovering.
+const RETRY_JITTER_RATIO = 0.3;
+
+/**
+ * Exponential backoff delay with random jitter.
+ *
+ * @param {number} attempt - Zero-based attempt number
+ * @returns {number} Delay in seconds
+ */
+function backoffDelaySeconds(attempt) {
+  const base = BASE_RETRY_DELAY * 2 ** attempt;
+  return base * (1 - RETRY_JITTER_RATIO + Math.random() * 2 * RETRY_JITTER_RATIO);
+}
+
 // Minimal stand-in for an http.ClientRequest. socks-proxy-agent calls
 // req.emit('proxy', ...) after a successful connection and req.destroy() on
 // cleanup, but never reads any request state, so a no-op object is enough.
@@ -136,50 +156,70 @@ function buildSocksConnect(socksAgent, tlsHandshakeTimeoutMs = SOCKS_TUNNEL_TIME
   return (opts, callback) => {
     const isTls = opts.protocol === 'https:';
     const host = opts.hostname || opts.host;
+    const tunnelOpts = {
+      host,
+      port: resolveSocksPort(opts.protocol, opts.port),
+      secureEndpoint: isTls,
+      servername: isTls ? opts.servername || host || undefined : undefined,
+      localAddress: opts.localAddress,
+    };
 
-    socksAgent
-      .connect(_socksFakeReq, {
-        host,
-        port: resolveSocksPort(opts.protocol, opts.port),
-        secureEndpoint: isTls,
-        servername: isTls ? opts.servername || host || undefined : undefined,
-        localAddress: opts.localAddress,
-      })
-      .then((socket) => {
-        if (!isTls) {
-          callback(null, socket);
-          return;
-        }
+    const onTunnelEstablished = (socket) => {
+      if (!isTls) {
+        callback(null, socket);
+        return;
+      }
 
-        let settled = false;
-        const onError = (err) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          socket.removeListener('error', onError);
+      let settled = false;
+      const onError = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.removeListener('error', onError);
+        callback(err);
+        socket.destroy();
+      };
+      const onSecure = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.removeListener('error', onError);
+        callback(null, socket);
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.removeListener('error', onError);
+        const err = new Error(`TLS handshake timed out after ${tlsHandshakeTimeoutMs}ms`);
+        err.code = 'UND_ERR_CONNECT_TIMEOUT';
+        socket.destroy();
+        callback(err);
+      }, tlsHandshakeTimeoutMs);
+      socket.once('secureConnect', onSecure);
+      socket.on('error', onError);
+    };
+
+    const attemptTunnel = (attempt) => {
+      socksAgent
+        .connect(_socksFakeReq, tunnelOpts)
+        .then(onTunnelEstablished)
+        .catch((err) => {
+          // Only SOCKS tunnel failures land here. TLS handshake errors are
+          // delivered through onTunnelEstablished's listeners and are never
+          // retried (they are deterministic, e.g. certificate mismatches).
+          if (attempt + 1 < SOCKS_TUNNEL_MAX_ATTEMPTS) {
+            logger.warning(
+              `SOCKS tunnel attempt ${attempt + 1}/${SOCKS_TUNNEL_MAX_ATTEMPTS} failed (${err.message}); ` +
+                `retrying in ${SOCKS_TUNNEL_RETRY_DELAY_MS}ms`
+            );
+            setTimeout(() => attemptTunnel(attempt + 1), SOCKS_TUNNEL_RETRY_DELAY_MS);
+            return;
+          }
           callback(err);
-          socket.destroy();
-        };
-        const onSecure = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          socket.removeListener('error', onError);
-          callback(null, socket);
-        };
-        const timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          socket.removeListener('error', onError);
-          const err = new Error(`TLS handshake timed out after ${tlsHandshakeTimeoutMs}ms`);
-          err.code = 'UND_ERR_CONNECT_TIMEOUT';
-          socket.destroy();
-          callback(err);
-        }, tlsHandshakeTimeoutMs);
-        socket.once('secureConnect', onSecure);
-        socket.on('error', onError);
-      })
-      .catch((err) => callback(err));
+        });
+    };
+
+    attemptTunnel(0);
   };
 }
 
@@ -310,8 +350,8 @@ class KiroHttpClient {
         // 429 - rate limit, wait and retry
         if (response.statusCode === 429) {
           lastResponse = response;
-          const delay = BASE_RETRY_DELAY * 2 ** attempt;
-          logger.warning(`Received 429, waiting ${delay}s (attempt ${attempt + 1}/${maxRetries})`);
+          const delay = backoffDelaySeconds(attempt);
+          logger.warning(`Received 429, waiting ${delay.toFixed(2)}s (attempt ${attempt + 1}/${maxRetries})`);
           await this._sleep(delay);
           continue;
         }
@@ -319,8 +359,10 @@ class KiroHttpClient {
         // 5xx - server error, wait and retry
         if (response.statusCode >= 500 && response.statusCode < 600) {
           lastResponse = response;
-          const delay = BASE_RETRY_DELAY * 2 ** attempt;
-          logger.warning(`Received ${response.statusCode}, waiting ${delay}s (attempt ${attempt + 1}/${maxRetries})`);
+          const delay = backoffDelaySeconds(attempt);
+          logger.warning(
+            `Received ${response.statusCode}, waiting ${delay.toFixed(2)}s (attempt ${attempt + 1}/${maxRetries})`
+          );
           await this._sleep(delay);
           continue;
         }
@@ -337,8 +379,8 @@ class KiroHttpClient {
         lastErrorInfo = errorInfo;
 
         if (errorInfo.isRetryable && attempt < maxRetries - 1) {
-          const delay = BASE_RETRY_DELAY * 2 ** attempt;
-          logger.warning(`${errorInfo.userMessage} - waiting ${delay}s (attempt ${attempt + 1}/${maxRetries})`);
+          const delay = backoffDelaySeconds(attempt);
+          logger.warning(`${errorInfo.userMessage} - waiting ${delay.toFixed(2)}s (attempt ${attempt + 1}/${maxRetries})`);
           await this._sleep(delay);
         } else {
           logger.error(`${errorInfo.userMessage} - no more retries (attempt ${attempt + 1}/${maxRetries})`);
@@ -410,5 +452,6 @@ module.exports = {
   buildSocksConnect,
   createSocksDispatcher,
   resolveSocksPort,
+  backoffDelaySeconds,
   consumeBody,
 };

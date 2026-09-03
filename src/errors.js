@@ -239,6 +239,10 @@ function classifyNetworkError(error) {
     category = ErrorCategory.NETWORK_UNREACHABLE;
   } else if (causeCode === 'ERR_TLS_CERT_ALTNAME_INVALID' || causeCode.startsWith('CERT') || /SSL|TLS/i.test(causeStr)) {
     category = ErrorCategory.SSL_ERROR;
+  } else if (/Invalid EOF state|does not match the HTTP\/1\.1 protocol|other side closed/i.test(causeStr)) {
+    // Mid-stream connection break surfaced by the HTTP/1.1 parser, common
+    // when a proxy drops the tunnel mid-response.
+    category = ErrorCategory.CONNECTION_RESET;
   } else if (errorType === 'ProxyError' || /proxy/i.test(causeStr)) {
     category = ErrorCategory.PROXY_ERROR;
   }
