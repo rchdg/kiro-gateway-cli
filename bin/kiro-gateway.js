@@ -20,7 +20,7 @@
 
 const { CliError, splitCommand, parseCliArgs, buildHelpText } = require('../src/cliArgs');
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = require('../package.json').version;
 const APP_TITLE = 'Kiro Gateway (Node CLI)';
 const APP_DESCRIPTION =
   'Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible.';

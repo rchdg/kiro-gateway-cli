@@ -93,7 +93,7 @@ function parseCliArgs(argv) {
       result.help = true;
       continue;
     }
-    if (arg === '-v' || arg === '--version') {
+    if (arg === '-v' || arg === '-V' || arg === '--version') {
       result.version = true;
       continue;
     }
