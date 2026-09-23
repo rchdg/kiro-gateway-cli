@@ -1,6 +1,6 @@
 {
   "name": "kiro-gateway-cli",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Node.js CLI gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible proxy server.",
   "type": "commonjs",
   "main": "dist/kiro-gateway.js",

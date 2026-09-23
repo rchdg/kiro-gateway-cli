@@ -20,11 +20,16 @@ const {
   FIRST_TOKEN_TIMEOUT,
   FIRST_TOKEN_MAX_RETRIES,
   STREAMING_READ_TIMEOUT,
+  STREAM_KEEPALIVE_INTERVAL,
   FAKE_REASONING_ENABLED,
   FAKE_REASONING_HANDLING,
 } = require('../config');
 
 const logger = new Logger();
+
+// Distinguishes "the idle timer won the race" from a real iterator result,
+// which can legitimately be any value including undefined.
+const KEEPALIVE_TICK = Symbol('keepalive-tick');
 
 class FirstTokenTimeoutError extends Error {
   constructor(timeout) {
@@ -546,6 +551,80 @@ function describeAttemptFailure(error, firstTokenTimeout) {
 }
 
 /**
+ * Forwards a chunk generator, injecting a keepalive chunk whenever the source
+ * stays silent for longer than `intervalSeconds`.
+ *
+ * The gateway has two unavoidable silent stretches: waiting for the upstream
+ * first token (up to FIRST_TOKEN_TIMEOUT per attempt, retried), and buffering
+ * a tool call, whose argument fragments yield no output event until the
+ * upstream stream ends. Both look identical to a dead connection from the
+ * client side, and clients act on that: min-agent aborts after 90s of silence,
+ * which truncates the response mid-body. Keepalive bytes keep the body alive
+ * without altering the event sequence - SSE comments and Anthropic `ping`
+ * events are both ignored by conforming parsers.
+ *
+ * @param {AsyncIterable<string>} source - Upstream chunk generator
+ * @param {object} options - Keepalive options
+ * @param {string} options.keepaliveChunk - Chunk emitted while the source is silent
+ * @param {number} [options.intervalSeconds=STREAM_KEEPALIVE_INTERVAL] - Silence
+ *   threshold in seconds; 0 or less disables keepalive entirely
+ * @returns {AsyncGenerator<string, void, void>} Source chunks plus keepalives
+ */
+async function* withKeepalive(source, {
+  keepaliveChunk,
+  intervalSeconds = STREAM_KEEPALIVE_INTERVAL,
+} = {}) {
+  if (!keepaliveChunk || !(intervalSeconds > 0)) {
+    yield* source;
+    return;
+  }
+
+  const iterator = source[Symbol.asyncIterator]();
+  const intervalMs = intervalSeconds * 1000;
+
+  // A single pending next() must survive across keepalive ticks: calling
+  // next() again before the previous one settles would drop chunks.
+  let pending = null;
+  try {
+    while (true) {
+      if (!pending) pending = iterator.next();
+
+      let timer;
+      const idle = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(KEEPALIVE_TICK), intervalMs);
+      });
+
+      let settled;
+      try {
+        settled = await Promise.race([pending, idle]);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (settled === KEEPALIVE_TICK) {
+        yield keepaliveChunk;
+        continue;
+      }
+
+      pending = null;
+      if (settled.done) return;
+      yield settled.value;
+    }
+  } finally {
+    // Swallow the abandoned next() so an aborted upstream cannot surface as an
+    // unhandled rejection after the consumer walked away.
+    if (pending) pending.catch(() => {});
+    if (typeof iterator.return === 'function') {
+      try {
+        await iterator.return();
+      } catch {
+        // Generator already finished
+      }
+    }
+  }
+}
+
+/**
  * Reads the full text of a response body.
  *
  * @param {object} body - undici body stream
@@ -586,6 +665,7 @@ module.exports = {
   calculateTokensFromContextUsage,
   streamWithFirstTokenRetry,
   describeAttemptFailure,
+  withKeepalive,
   readBodyText,
   cancelBody,
 };

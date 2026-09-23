@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const {
   parseKiroStream,
   collectStreamToResult,
+  withKeepalive,
   FirstTokenTimeoutError,
   EmptyUpstreamStreamError,
 } = require('../src/streaming/core');
@@ -634,4 +635,115 @@ test('streamWithFirstTokenRetryOpenAI: does not retry after data reached the cli
   );
 
   assert.equal(requestCount, 1);
+});
+
+// ==================================================================================================
+// Keepalive during silent stretches
+// ==================================================================================================
+
+test('withKeepalive emits keepalive chunks while the source is silent', async () => {
+  const KEEPALIVE = ': keepalive\n\n';
+
+  // Silent for ~5 keepalive intervals, then a single real chunk.
+  async function* slowSource() {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    yield 'data: real\n\n';
+  }
+
+  const received = [];
+  for await (const chunk of withKeepalive(slowSource(), {
+    keepaliveChunk: KEEPALIVE,
+    intervalSeconds: 0.02,
+  })) {
+    received.push(chunk);
+  }
+
+  const keepalives = received.filter((c) => c === KEEPALIVE);
+  const real = received.filter((c) => c !== KEEPALIVE);
+
+  assert.ok(keepalives.length >= 2, `expected keepalives, got ${keepalives.length}`);
+  assert.deepEqual(real, ['data: real\n\n']);
+  // The real chunk must still arrive last, after the keepalives.
+  assert.equal(received[received.length - 1], 'data: real\n\n');
+});
+
+test('withKeepalive forwards every chunk in order and adds none when the source is busy', async () => {
+  async function* fastSource() {
+    yield 'a';
+    yield 'b';
+    yield 'c';
+  }
+
+  const received = [];
+  for await (const chunk of withKeepalive(fastSource(), {
+    keepaliveChunk: ': keepalive\n\n',
+    intervalSeconds: 5,
+  })) {
+    received.push(chunk);
+  }
+
+  assert.deepEqual(received, ['a', 'b', 'c']);
+});
+
+test('withKeepalive is a passthrough when disabled', async () => {
+  async function* source() {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    yield 'x';
+  }
+
+  for (const intervalSeconds of [0, -1]) {
+    const received = [];
+    for await (const chunk of withKeepalive(source(), {
+      keepaliveChunk: ': keepalive\n\n',
+      intervalSeconds,
+    })) {
+      received.push(chunk);
+    }
+    assert.deepEqual(received, ['x']);
+  }
+});
+
+test('withKeepalive propagates source errors instead of looping on keepalives', async () => {
+  async function* failingSource() {
+    yield 'first';
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    throw new Error('Response does not match the HTTP/1.1 protocol (Invalid EOF state)');
+  }
+
+  const received = [];
+  await assert.rejects(
+    (async () => {
+      for await (const chunk of withKeepalive(failingSource(), {
+        keepaliveChunk: ': keepalive\n\n',
+        intervalSeconds: 0.02,
+      })) {
+        received.push(chunk);
+      }
+    })(),
+    /Invalid EOF state/
+  );
+
+  assert.equal(received[0], 'first');
+  assert.ok(received.length >= 2, 'keepalives should precede the failure');
+});
+
+test('withKeepalive does not drop a chunk that resolves during a keepalive tick', async () => {
+  // The source settles between ticks; a naive implementation that re-calls
+  // next() on every tick would lose this value.
+  async function* source() {
+    for (const value of ['one', 'two', 'three']) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      yield value;
+    }
+  }
+
+  const real = [];
+  for await (const chunk of withKeepalive(source(), {
+    keepaliveChunk: ': keepalive\n\n',
+    intervalSeconds: 0.02,
+  })) {
+    if (chunk !== ': keepalive\n\n') real.push(chunk);
+  }
+
+  assert.deepEqual(real, ['one', 'two', 'three']);
 });

@@ -15,10 +15,18 @@
 
 const express = require('express');
 const { Logger } = require('./logger');
-const { ApiError, ErrorType, classifyError, parseKiroError } = require('./errors');
+const {
+  ApiError,
+  ErrorType,
+  ErrorCategory,
+  classifyError,
+  classifyNetworkError,
+  parseKiroError,
+} = require('./errors');
 const { KiroHttpClient } = require('./httpClient');
 const { buildKiroPayloadOpenAI } = require('./converters/openai');
 const { anthropicToKiro } = require('./converters/anthropic');
+const { withKeepalive } = require('./streaming/core');
 const {
   streamWithFirstTokenRetryOpenAI,
   collectStreamResponse,
@@ -38,6 +46,12 @@ const {
 } = require('./config');
 
 const logger = new Logger();
+
+// Keepalive payloads for silent stretches of a stream. An SSE comment is
+// invisible to any conforming OpenAI-compatible client, and `ping` is a
+// documented Anthropic stream event, so neither disturbs the event sequence.
+const OPENAI_KEEPALIVE_CHUNK = ': keepalive\n\n';
+const ANTHROPIC_KEEPALIVE_CHUNK = `event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`;
 
 // ==================================================================================================
 // Small HTTP helpers
@@ -604,6 +618,26 @@ function createServer({ accountManager, accountSystem = false }) {
 // ==================================================================================================
 
 /**
+ * Turns a mid-stream failure into a message worth showing a client.
+ *
+ * Transport failures arrive as raw HTTP-parser text ("Response does not match
+ * the HTTP/1.1 protocol (Invalid EOF state)"), which describes the gateway's
+ * own upstream hop and reads like a bug in the caller. Classifying it names the
+ * real problem and keeps the technical detail for diagnosis.
+ *
+ * @param {Error} err - The failure that ended the stream
+ * @returns {string} Message for the client
+ */
+function describeStreamFailure(err) {
+  const raw = err && err.message ? err.message : 'Upstream streaming request failed';
+  if (err && err.statusCode) return raw;
+
+  const info = classifyNetworkError(err);
+  if (info.category === ErrorCategory.UNKNOWN) return raw;
+  return `${info.userMessage} (upstream connection to the Kiro API; ${info.technicalDetails})`;
+}
+
+/**
  * Formats a mid-stream failure as an OpenAI-compatible SSE error chunk.
  *
  * @param {Error} err - The failure that ended the stream
@@ -612,7 +646,7 @@ function createServer({ accountManager, accountSystem = false }) {
 function formatOpenAIStreamError(err) {
   const payload = {
     error: {
-      message: err && err.message ? err.message : 'Upstream streaming request failed',
+      message: describeStreamFailure(err),
       type: 'kiro_api_error',
       code: err && err.statusCode ? err.statusCode : 502,
     },
@@ -640,7 +674,10 @@ async function streamOpenAIResponse(res, ac, options) {
   let clientDisconnected = false;
 
   try {
-    for await (const chunk of streamWithFirstTokenRetryOpenAI(options)) {
+    const chunks = withKeepalive(streamWithFirstTokenRetryOpenAI(options), {
+      keepaliveChunk: OPENAI_KEEPALIVE_CHUNK,
+    });
+    for await (const chunk of chunks) {
       if (res.writableEnded || res.destroyed || ac.signal.aborted) {
         clientDisconnected = true;
         break;
@@ -700,7 +737,10 @@ async function streamAnthropicResponse(res, ac, options) {
   let clientDisconnected = false;
 
   try {
-    for await (const chunk of streamWithFirstTokenRetryAnthropic(options)) {
+    const chunks = withKeepalive(streamWithFirstTokenRetryAnthropic(options), {
+      keepaliveChunk: ANTHROPIC_KEEPALIVE_CHUNK,
+    });
+    for await (const chunk of chunks) {
       if (res.writableEnded || res.destroyed || ac.signal.aborted) {
         clientDisconnected = true;
         break;
@@ -717,7 +757,7 @@ async function streamAnthropicResponse(res, ac, options) {
       try {
         const errorEvent = `event: error\ndata: ${JSON.stringify({
           type: 'error',
-          error: { type: 'api_error', message: err.message },
+          error: { type: 'api_error', message: describeStreamFailure(err) },
         })}\n\n`;
         res.write(errorEvent);
       } catch {

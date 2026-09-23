@@ -217,6 +217,15 @@ const FIRST_TOKEN_TIMEOUT = envFloat('FIRST_TOKEN_TIMEOUT', 90);
 const STREAMING_READ_TIMEOUT = envFloat('STREAMING_READ_TIMEOUT', 300);
 const FIRST_TOKEN_MAX_RETRIES = envInt('FIRST_TOKEN_MAX_RETRIES', 3);
 
+// Clients watch the response body for silence and abort when nothing arrives
+// for a while (min-agent gives up after 90s, for example). The gateway is
+// legitimately silent for long stretches - while waiting for the first token,
+// and while buffering a tool call, whose argument fragments produce no output
+// event until the upstream stream ends. Emitting a keepalive byte on that
+// cadence keeps those waits from looking like a dead connection. Set to 0 to
+// disable.
+const STREAM_KEEPALIVE_INTERVAL = envFloat('STREAM_KEEPALIVE_INTERVAL', 15);
+
 // ==================================================================================================
 // Account System Settings
 // ==================================================================================================
@@ -312,6 +321,7 @@ module.exports = {
   FIRST_TOKEN_TIMEOUT,
   STREAMING_READ_TIMEOUT,
   FIRST_TOKEN_MAX_RETRIES,
+  STREAM_KEEPALIVE_INTERVAL,
   ACCOUNT_SYSTEM,
   ACCOUNTS_CONFIG_FILE,
   ACCOUNT_RECOVERY_TIMEOUT,
