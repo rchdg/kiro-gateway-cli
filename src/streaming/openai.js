@@ -18,6 +18,7 @@ const {
   calculateTokensFromContextUsage,
   streamWithFirstTokenRetry,
   describeAttemptFailure,
+  logRefusal,
 } = require('./core');
 
 const logger = new Logger();
@@ -61,6 +62,7 @@ async function* streamKiroToOpenAIInternal(response, {
   let fullContent = '';
   let fullThinkingContent = '';
   let toolCallsFromStream = [];
+  let refusal = null;
 
   try {
     for await (const event of parseKiroStream(response, { firstTokenTimeout })) {
@@ -106,6 +108,9 @@ async function* streamKiroToOpenAIInternal(response, {
         meteringData = event.usage;
       } else if (event.type === 'context_usage' && event.contextUsagePercentage !== null) {
         contextUsagePercentage = event.contextUsagePercentage;
+      } else if (event.type === 'refusal' && event.refusal) {
+        refusal = event.refusal;
+        logRefusal(event.refusal);
       }
     }
 
@@ -128,9 +133,12 @@ async function* streamKiroToOpenAIInternal(response, {
       );
     }
 
-    // Determine finish_reason (truncation has the highest priority)
+    // Determine finish_reason (a refusal outranks everything: the turn was cut
+    // short upstream, so neither "stop" nor "length" describes what happened)
     let finishReason;
-    if (contentWasTruncated) {
+    if (refusal) {
+      finishReason = 'content_filter';
+    } else if (contentWasTruncated) {
       finishReason = 'length';
     } else if (allToolCalls.length > 0) {
       finishReason = 'tool_calls';
@@ -205,6 +213,13 @@ async function* streamKiroToOpenAIInternal(response, {
         total_tokens: totalTokens,
       },
     };
+
+    // OpenAI carries refusals on delta.refusal; without it the client only sees
+    // a short answer and has no way to tell the turn was cut short.
+    if (refusal) {
+      finalChunk.choices[0].delta.refusal =
+        refusal.explanation || `Upstream refused the turn (${refusal.category || refusal.stopReason}).`;
+    }
 
     if (meteringData) {
       finalChunk.usage.credits_used = meteringData;
@@ -304,6 +319,7 @@ async function collectStreamResponse(response, { model, modelCache, requestMessa
   let finalUsage = null;
   const toolCalls = [];
   let finishReason = 'stop';
+  let refusal = null;
   const completionId = generateCompletionId();
 
   for await (const chunkStr of streamKiroToOpenAI(response, {
@@ -322,6 +338,7 @@ async function collectStreamResponse(response, { model, modelCache, requestMessa
       const delta = ((chunkData.choices || [{}])[0] || {}).delta || {};
       if (delta.content) fullContent += delta.content;
       if (delta.reasoning_content) fullReasoningContent += delta.reasoning_content;
+      if (delta.refusal) refusal = delta.refusal;
       if (delta.tool_calls) toolCalls.push(...delta.tool_calls);
 
       const finishReasonFromChunk = ((chunkData.choices || [{}])[0] || {}).finish_reason;
@@ -337,6 +354,9 @@ async function collectStreamResponse(response, { model, modelCache, requestMessa
   const message = { role: 'assistant', content: fullContent };
   if (fullReasoningContent) {
     message.reasoning_content = fullReasoningContent;
+  }
+  if (refusal) {
+    message.refusal = refusal;
   }
   if (toolCalls.length > 0) {
     // Remove the index field (only required for streaming chunks)

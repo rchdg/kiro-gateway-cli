@@ -75,6 +75,7 @@ function makeKiroEvent({
   contextUsagePercentage = null,
   isFirstThinkingChunk = false,
   isLastThinkingChunk = false,
+  refusal = null,
 }) {
   return {
     type,
@@ -85,7 +86,30 @@ function makeKiroEvent({
     contextUsagePercentage,
     isFirstThinkingChunk,
     isLastThinkingChunk,
+    refusal,
   };
+}
+
+/**
+ * Logs an upstream refusal so an aborted turn is never silent.
+ *
+ * `REASONING_EXTRACTION` is the common one: Kiro kills the turn as soon as the
+ * model starts emitting a reasoning/scratchpad block, which is why tag-based
+ * "fake reasoning" cannot work against this backend.
+ *
+ * @param {object} refusal - Refusal details from the metadataEvent
+ */
+function logRefusal(refusal) {
+  const parts = [`stopReason=${refusal.stopReason || 'unknown'}`];
+  if (refusal.category) parts.push(`category=${refusal.category}`);
+  logger.error(`[Refusal] Kiro aborted the turn: ${parts.join(' ')}`);
+  if (refusal.explanation) logger.error(`[Refusal] ${refusal.explanation}`);
+  if (refusal.category === 'REASONING_EXTRACTION') {
+    logger.error(
+      '[Refusal] Kiro blocks reasoning extraction. Keep FAKE_REASONING disabled; ' +
+        'asking the model for <thinking> blocks will keep getting turns filtered.'
+    );
+  }
 }
 
 /**
@@ -290,6 +314,8 @@ function processChunk(parser, chunk, thinkingParser) {
       events.push(makeKiroEvent({ type: 'usage', usage: event.data }));
     } else if (event.type === 'context_usage') {
       events.push(makeKiroEvent({ type: 'context_usage', contextUsagePercentage: event.data }));
+    } else if (event.type === 'refusal') {
+      events.push(makeKiroEvent({ type: 'refusal', refusal: event.data }));
     }
   }
 
@@ -314,6 +340,7 @@ async function collectStreamToResult(response, options = {}) {
     toolCalls: [],
     usage: null,
     contextUsagePercentage: null,
+    refusal: null,
   };
   let fullContentForBracketTools = '';
 
@@ -330,6 +357,9 @@ async function collectStreamToResult(response, options = {}) {
       result.usage = event.usage;
     } else if (event.type === 'context_usage' && event.contextUsagePercentage !== null) {
       result.contextUsagePercentage = event.contextUsagePercentage;
+    } else if (event.type === 'refusal' && event.refusal) {
+      result.refusal = event.refusal;
+      logRefusal(event.refusal);
     }
   }
 
@@ -662,6 +692,7 @@ module.exports = {
   parseKiroStream,
   processChunk,
   collectStreamToResult,
+  logRefusal,
   calculateTokensFromContextUsage,
   streamWithFirstTokenRetry,
   describeAttemptFailure,

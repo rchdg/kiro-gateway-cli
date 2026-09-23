@@ -135,7 +135,7 @@ environment variables:
 | `KIRO_PID_FILE` | PID file for `--background` mode (default: `.kiro-gateway.pid`) |
 | `KIRO_LOG_FILE` | Log file for `--background` mode (default: `kiro-gateway.log`) |
 | `ACCOUNT_SYSTEM` | Enable multi-account failover (`true`/`false`) |
-| `FAKE_REASONING` | Extended thinking via tag injection (default: enabled) |
+| `FAKE_REASONING` | Extended thinking via tag injection (default: **disabled**). Kiro blocks reasoning extraction server-side: once the model opens a `<thinking>` block the turn comes back as `CONTENT_FILTERED` / `REASONING_EXTRACTION` and the answer is lost. Set to `1` to opt in at your own risk |
 | `FIRST_TOKEN_TIMEOUT` | First-token wait before retry (default: 15s) |
 
 ### Credentials (multi-account)

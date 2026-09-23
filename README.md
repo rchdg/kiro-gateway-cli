@@ -117,7 +117,7 @@ kiro-gateway stop
 | `KIRO_PID_FILE` | `--background` 模式的 PID 文件（默认：`.kiro-gateway.pid`） |
 | `KIRO_LOG_FILE` | `--background` 模式的日志文件（默认：`kiro-gateway.log`） |
 | `ACCOUNT_SYSTEM` | 启用多账号故障切换（`true`/`false`） |
-| `FAKE_REASONING` | 通过标签注入实现扩展思考（默认：启用） |
+| `FAKE_REASONING` | 通过标签注入实现扩展思考（默认：**关闭**）。Kiro 服务端会拦截思维链提取：模型一旦开始输出 `<thinking>` 块，该轮就以 `CONTENT_FILTERED` / `REASONING_EXTRACTION` 被终止，答案丢失。设为 `1` 可自行承担风险开启 |
 | `FIRST_TOKEN_TIMEOUT` | 重试前等待首个 token 的时间（默认：15 秒） |
 
 ### 凭据（多账号）

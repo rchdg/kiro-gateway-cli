@@ -189,9 +189,14 @@ const TOOL_DESCRIPTION_MAX_LENGTH = envInt('TOOL_DESCRIPTION_MAX_LENGTH', 10000)
 // Fake Reasoning Settings (Extended Thinking via Tag Injection)
 // ==================================================================================================
 
-const FAKE_REASONING_ENABLED = envStr('FAKE_REASONING', '') === ''
-  ? true
-  : !['false', '0', 'no', 'disabled', 'off'].includes(envStr('FAKE_REASONING', '').toLowerCase());
+// Off by default. Kiro rejects reasoning extraction server-side: the moment the
+// model opens a <thinking> / <scratchpad> block, the turn comes back with
+// stopReason CONTENT_FILTERED and a REASONING_EXTRACTION refusal, losing the
+// answer. So the injection either does nothing (model ignores it) or destroys
+// the turn (model complies). Set FAKE_REASONING=1 to opt back in.
+const FAKE_REASONING_ENABLED = ['1', 'true', 'yes', 'enabled', 'on'].includes(
+  envStr('FAKE_REASONING', '').toLowerCase()
+);
 
 const FAKE_REASONING_MAX_TOKENS = envInt('FAKE_REASONING_MAX_TOKENS', 4000);
 const FAKE_REASONING_BUDGET_CAP = envInt('FAKE_REASONING_BUDGET_CAP', 10000);

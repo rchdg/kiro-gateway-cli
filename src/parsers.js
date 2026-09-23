@@ -185,6 +185,11 @@ class AwsEventStreamParser {
     ['{"followupPrompt":', 'followup'],
     ['{"usage":', 'usage'],
     ['{"contextUsagePercentage":', 'context_usage'],
+    // metadataEvent: Kiro aborts the turn here (e.g. stopReason CONTENT_FILTERED
+    // with a REASONING_EXTRACTION refusal). Without this the turn silently
+    // looks like a short but successful answer.
+    ['{"stopDetails":', 'stop_details'],
+    ['{"stopReason":', 'stop_details'],
   ];
 
   /**
@@ -255,9 +260,37 @@ class AwsEventStreamParser {
         return { type: 'usage', data: data.usage || 0 };
       case 'context_usage':
         return { type: 'context_usage', data: data.contextUsagePercentage || 0 };
+      case 'stop_details':
+        return this._processStopDetailsEvent(data);
       default:
         return null;
     }
+  }
+
+  /**
+   * Processes a metadataEvent carrying stop details.
+   *
+   * Kiro ends a turn early with `stopReason` (e.g. `CONTENT_FILTERED`) and an
+   * optional `stopDetails.refusal`. Only abnormal stops produce an event; a
+   * plain `stopReason: "END_TURN"` is not worth reporting.
+   *
+   * @param {object} data - Event data
+   * @returns {{type: string, data: object}|null} Refusal event or null
+   */
+  _processStopDetailsEvent(data) {
+    const stopReason = typeof data.stopReason === 'string' ? data.stopReason : null;
+    const refusal = (data.stopDetails && data.stopDetails.refusal) || null;
+
+    if (!refusal && (!stopReason || stopReason === 'END_TURN')) return null;
+
+    return {
+      type: 'refusal',
+      data: {
+        stopReason,
+        category: (refusal && refusal.category) || null,
+        explanation: (refusal && refusal.explanation) || null,
+      },
+    };
   }
 
   /**

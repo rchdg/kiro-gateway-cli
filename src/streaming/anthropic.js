@@ -26,6 +26,7 @@ const {
   calculateTokensFromContextUsage,
   streamWithFirstTokenRetry,
   describeAttemptFailure,
+  logRefusal,
 } = require('./core');
 
 const logger = new Logger();
@@ -94,7 +95,7 @@ async function* streamKiroToAnthropic(response, {
   let outputTokens = 0;
   let fullContent = '';
   let fullThinkingContent = '';
-
+  let refusal = null;
   // Anthropic requires input_tokens in message_start, but Kiro provides
   // accurate context_usage only at the end. Use fallback estimation.
   if (requestMessages || requestTools || requestSystem) {
@@ -269,6 +270,9 @@ async function* streamKiroToAnthropic(response, {
         contextUsagePercentage = event.contextUsagePercentage;
       } else if (event.type === 'usage' && event.usage) {
         Object.assign(upstreamCacheUsage, extractCacheUsageFields(event.usage));
+      } else if (event.type === 'refusal' && event.refusal) {
+        refusal = event.refusal;
+        logRefusal(event.refusal);
       }
     }
 
@@ -385,9 +389,12 @@ async function* streamKiroToAnthropic(response, {
       }
     }
 
-    // Determine the stop reason (truncation has the highest priority)
+    // Determine the stop reason (a refusal outranks the rest: the turn was cut
+    // short upstream, so end_turn would be a lie)
     let stopReason;
-    if (contentWasTruncated) {
+    if (refusal) {
+      stopReason = 'refusal';
+    } else if (contentWasTruncated) {
       stopReason = 'max_tokens';
     } else if (toolBlocks.length > 0) {
       stopReason = 'tool_use';
@@ -519,7 +526,9 @@ async function collectAnthropicResponse(response, { model, modelCache, requestMe
 
   // Determine the stop reason
   let stopReason;
-  if (contentWasTruncated) {
+  if (result.refusal) {
+    stopReason = 'refusal';
+  } else if (contentWasTruncated) {
     stopReason = 'max_tokens';
   } else if (result.toolCalls.length > 0) {
     stopReason = 'tool_use';

@@ -1,5 +1,9 @@
 'use strict';
 
+// Fake reasoning is opt-in (Kiro filters reasoning extraction), so the tag
+// injection test has to turn it on before config.js is first required.
+process.env.FAKE_REASONING = '1';
+
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 

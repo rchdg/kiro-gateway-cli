@@ -1,5 +1,9 @@
 'use strict';
 
+// Fake reasoning is opt-in (Kiro filters reasoning extraction), so the thinking
+// tests below have to turn it on before config.js is first required.
+process.env.FAKE_REASONING = '1';
+
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -300,6 +304,59 @@ test('collectStreamResponse: includes reasoning_content', async () => {
 // streamKiroToAnthropic
 // ==================================================================================================
 
+test('streamKiroToOpenAI: an upstream refusal becomes finish_reason content_filter', async () => {
+  const response = makeResponse([
+    buildEventChunk([
+      { content: 'partial' },
+      {
+        stopDetails: {
+          refusal: {
+            category: 'REASONING_EXTRACTION',
+            explanation: 'The selected model cannot continue this conversation.',
+          },
+        },
+        stopReason: 'CONTENT_FILTERED',
+      },
+      { contextUsagePercentage: 10 },
+    ]),
+  ]);
+
+  const chunks = [];
+  for await (const chunk of streamKiroToOpenAI(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+  })) {
+    chunks.push(chunk);
+  }
+
+  const last = JSON.parse(chunks[chunks.length - 2].slice('data:'.length).trim());
+  assert.equal(last.choices[0].finish_reason, 'content_filter');
+  assert.match(last.choices[0].delta.refusal, /cannot continue/);
+});
+
+test('collectStreamResponse: carries the refusal on the message', async () => {
+  const response = makeResponse([
+    buildEventChunk([
+      { content: 'partial' },
+      {
+        stopDetails: { refusal: { category: 'REASONING_EXTRACTION', explanation: 'Blocked upstream.' } },
+        stopReason: 'CONTENT_FILTERED',
+      },
+      { contextUsagePercentage: 10 },
+    ]),
+  ]);
+
+  const result = await collectStreamResponse(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    requestMessages: [{ role: 'user', content: 'hi' }],
+  });
+
+  assert.equal(result.choices[0].finish_reason, 'content_filter');
+  assert.equal(result.choices[0].message.refusal, 'Blocked upstream.');
+});
+
 test('streamKiroToAnthropic: full SSE sequence', async () => {
   const response = makeResponse([
     buildEventChunk([{ content: 'Hello' }, { content: ' world' }, { contextUsagePercentage: 10 }]),
@@ -407,6 +464,27 @@ test('collectAnthropicResponse: forms full message', async () => {
   assert.equal(result.stop_reason, 'end_turn');
   assert.ok(result.usage.input_tokens > 0);
   assert.ok(result.usage.output_tokens > 0);
+});
+
+test('collectAnthropicResponse: an upstream refusal becomes stop_reason refusal', async () => {
+  const response = makeResponse([
+    buildEventChunk([
+      { content: 'partial' },
+      {
+        stopDetails: { refusal: { category: 'REASONING_EXTRACTION', explanation: 'Blocked upstream.' } },
+        stopReason: 'CONTENT_FILTERED',
+      },
+      { contextUsagePercentage: 10 },
+    ]),
+  ]);
+
+  const result = await collectAnthropicResponse(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    requestMessages: [{ role: 'user', content: 'Hi' }],
+  });
+
+  assert.equal(result.stop_reason, 'refusal');
 });
 
 // ==================================================================================================

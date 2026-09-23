@@ -147,6 +147,45 @@ test('AwsEventStreamParser: accumulates fragments split across chunks', () => {
   assert.equal(events2[0].data, 'hi');
 });
 
+test('AwsEventStreamParser: surfaces a CONTENT_FILTERED refusal', () => {
+  const parser = new AwsEventStreamParser();
+  const chunks = buildEventStreamChunks([
+    { content: '<thinking>The' },
+    {
+      stopDetails: {
+        refusal: {
+          category: 'REASONING_EXTRACTION',
+          explanation: 'The selected model cannot continue this conversation.',
+        },
+      },
+      stopReason: 'CONTENT_FILTERED',
+    },
+  ]);
+
+  const events = [];
+  for (const chunk of chunks) {
+    events.push(...parser.feed(chunk));
+  }
+
+  const refusals = events.filter((e) => e.type === 'refusal');
+  assert.equal(refusals.length, 1);
+  assert.equal(refusals[0].data.stopReason, 'CONTENT_FILTERED');
+  assert.equal(refusals[0].data.category, 'REASONING_EXTRACTION');
+  assert.match(refusals[0].data.explanation, /cannot continue/);
+});
+
+test('AwsEventStreamParser: a plain END_TURN stop is not a refusal', () => {
+  const parser = new AwsEventStreamParser();
+  const chunks = buildEventStreamChunks([{ stopReason: 'END_TURN' }]);
+
+  const events = [];
+  for (const chunk of chunks) {
+    events.push(...parser.feed(chunk));
+  }
+
+  assert.equal(events.filter((e) => e.type === 'refusal').length, 0);
+});
+
 test('AwsEventStreamParser: tool calls assembled from start/input/stop events', () => {
   const parser = new AwsEventStreamParser();
 
