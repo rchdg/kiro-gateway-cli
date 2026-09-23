@@ -7,6 +7,7 @@ const {
   parseKiroStream,
   collectStreamToResult,
   FirstTokenTimeoutError,
+  EmptyUpstreamStreamError,
 } = require('../src/streaming/core');
 const {
   streamKiroToOpenAI,
@@ -98,13 +99,16 @@ test('parseKiroStream: first token timeout raises', async () => {
   );
 });
 
-test('parseKiroStream: empty response ends cleanly', async () => {
+test('parseKiroStream: a body that closes without data is reported, not swallowed', async () => {
   const response = makeResponse([]);
-  const events = [];
-  for await (const event of parseKiroStream(response)) {
-    events.push(event);
-  }
-  assert.equal(events.length, 0);
+  await assert.rejects(
+    (async () => {
+      for await (const _event of parseKiroStream(response)) {
+        // no event is expected
+      }
+    })(),
+    EmptyUpstreamStreamError
+  );
 });
 
 test('parseKiroStream: extracts tool calls', async () => {
@@ -473,10 +477,68 @@ test('streamWithFirstTokenRetryOpenAI: exhausts retries and raises', async () =>
         // Never reached
       }
     })(),
-    /did not respond/
+    /did not respond within 0\.1s per attempt/
   );
 
   assert.equal(requestCount, 2);
+});
+
+test('streamWithFirstTokenRetryOpenAI: retries an upstream body that closes without data', async () => {
+  let requestCount = 0;
+
+  async function makeRequest() {
+    requestCount += 1;
+    // First attempt: 200 with an immediately finished body.
+    if (requestCount === 1) return makeResponse([]);
+    return makeResponse([buildEventChunk([{ content: 'recovered' }, { contextUsagePercentage: 10 }])]);
+  }
+
+  const chunks = [];
+  for await (const chunk of streamWithFirstTokenRetryOpenAI({
+    makeRequest,
+    initialResponse: await makeRequest(),
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    firstTokenTimeout: 0.5,
+    maxRetries: 3,
+  })) {
+    chunks.push(chunk);
+  }
+
+  assert.ok(requestCount >= 2, `expected a retry, got ${requestCount} requests`);
+  assert.ok(chunks.some((c) => c.includes('recovered')));
+});
+
+test('streamWithFirstTokenRetryOpenAI: reports the real reason when every attempt is reset', async () => {
+  async function makeRequest() {
+    return {
+      statusCode: 200,
+      body: {
+        [Symbol.asyncIterator]: async function* () {
+          const err = new Error('socket hang up');
+          err.cause = { code: 'ECONNRESET' };
+          throw err;
+        },
+      },
+    };
+  }
+
+  await assert.rejects(
+    (async () => {
+      for await (const _chunk of streamWithFirstTokenRetryOpenAI({
+        makeRequest,
+        initialResponse: await makeRequest(),
+        model: 'claude-sonnet-4.5',
+        modelCache: makeModelCache(),
+        firstTokenTimeout: 30,
+        maxRetries: 2,
+      })) {
+        // Never reached
+      }
+    })(),
+    // The old message blamed a first token timeout that never happened.
+    (err) => /reset by the server/.test(err.message) && !/did not respond/.test(err.message)
+  );
 });
 
 test('streamWithFirstTokenRetryOpenAI: propagates upstream HTTP errors', async () => {

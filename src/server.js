@@ -604,6 +604,23 @@ function createServer({ accountManager, accountSystem = false }) {
 // ==================================================================================================
 
 /**
+ * Formats a mid-stream failure as an OpenAI-compatible SSE error chunk.
+ *
+ * @param {Error} err - The failure that ended the stream
+ * @returns {string} "data: {...}\n\n" string carrying an `error` object
+ */
+function formatOpenAIStreamError(err) {
+  const payload = {
+    error: {
+      message: err && err.message ? err.message : 'Upstream streaming request failed',
+      type: 'kiro_api_error',
+      code: err && err.statusCode ? err.statusCode : 502,
+    },
+  };
+  return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+/**
  * Streams an OpenAI-formatted response to the client.
  *
  * @param {object} res - Express response
@@ -636,8 +653,12 @@ async function streamOpenAIResponse(res, ac, options) {
     } else {
       streamingError = err;
       logger.error(`HTTP 500 - POST /v1/chat/completions (streaming) - ${err.message.slice(0, 100)}`);
-      // Try to send [DONE] so the client doesn't hang
+      // The 200 headers are long gone, so the failure can only be reported
+      // inside the stream. An error chunk is what OpenAI-compatible clients
+      // read to surface the real reason; sending a bare [DONE] would look like
+      // a successful reply that the model simply left empty.
       try {
+        res.write(formatOpenAIStreamError(err));
         res.write('data: [DONE]\n\n');
       } catch {
         // Client already disconnected

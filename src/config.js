@@ -210,7 +210,10 @@ const FAKE_REASONING_INITIAL_BUFFER_SIZE = envInt('FAKE_REASONING_INITIAL_BUFFER
 // First Token Timeout Settings (Streaming Retry)
 // ==================================================================================================
 
-const FIRST_TOKEN_TIMEOUT = envFloat('FIRST_TOKEN_TIMEOUT', 15);
+// Reasoning models routinely stay silent for a minute before the first visible
+// token, so a short budget here turns normal thinking into a bogus "model did
+// not respond". STREAMING_READ_TIMEOUT still guards the rest of the stream.
+const FIRST_TOKEN_TIMEOUT = envFloat('FIRST_TOKEN_TIMEOUT', 90);
 const STREAMING_READ_TIMEOUT = envFloat('STREAMING_READ_TIMEOUT', 300);
 const FIRST_TOKEN_MAX_RETRIES = envInt('FIRST_TOKEN_MAX_RETRIES', 3);
 

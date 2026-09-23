@@ -17,6 +17,7 @@ const {
   parseKiroStream,
   calculateTokensFromContextUsage,
   streamWithFirstTokenRetry,
+  describeAttemptFailure,
 } = require('./core');
 
 const logger = new Logger();
@@ -262,11 +263,10 @@ async function* streamWithFirstTokenRetryOpenAI({
     return err;
   }
 
-  function createTimeoutError(retries, timeout) {
-    const err = new Error(
-      `Model did not respond within ${timeout}s after ${retries} attempts. Please try again.`
-    );
-    err.statusCode = 504;
+  function createTimeoutError(retries, timeout, lastError) {
+    const reason = describeAttemptFailure(lastError, timeout);
+    const err = new Error(`Upstream request failed after ${retries} attempts: ${reason}`);
+    err.statusCode = lastError && lastError.name === 'FirstTokenTimeoutError' ? 504 : 502;
     return err;
   }
 

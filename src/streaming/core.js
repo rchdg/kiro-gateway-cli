@@ -41,6 +41,21 @@ class ReadTimeoutError extends Error {
 }
 
 /**
+ * The upstream answered 200 but closed the body without a single event.
+ *
+ * Returning normally here would hand the client a successful-but-empty
+ * response, which is indistinguishable from "the model had nothing to say".
+ * It is raised instead so the retry loop gets a chance and, if every attempt
+ * ends the same way, the client is told what actually happened.
+ */
+class EmptyUpstreamStreamError extends Error {
+  constructor() {
+    super('Kiro API closed the response without sending any data');
+    this.name = 'EmptyUpstreamStreamError';
+  }
+}
+
+/**
  * Creates a KiroEvent object.
  *
  * @param {object} options - Event fields
@@ -152,8 +167,8 @@ async function* parseKiroStream(response, { firstTokenTimeout = FIRST_TOKEN_TIME
         new FirstTokenTimeoutError(firstTokenTimeout)
       );
       if (first.done) {
-        logger.debug('Empty response from Kiro API');
-        return;
+        logger.warning('[EmptyStream] Kiro API closed the response without sending any data');
+        throw new EmptyUpstreamStreamError();
       }
       firstChunk = new TextDecoder().decode(first.value);
       logger.debug('First token received');
@@ -456,6 +471,17 @@ async function* streamWithFirstTokenRetry({
         continue;
       }
 
+      if (err instanceof EmptyUpstreamStreamError) {
+        lastError = err;
+        logger.warning(
+          `[EmptyStream] Attempt ${attempt + 1}/${maxRetries} failed - ` +
+            'upstream closed the response without sending any data'
+        );
+
+        await cancelCurrentResponse();
+        continue;
+      }
+
       // Upstream HTTP errors are deterministic for this request - no retry
       if (err.isUpstreamHttpError) {
         await cancelCurrentResponse();
@@ -485,18 +511,38 @@ async function* streamWithFirstTokenRetry({
     }
   }
 
-  // All attempts exhausted
-  logger.error(
-    `[FirstTokenTimeout] All ${maxRetries} attempts exhausted - ` +
-      `model never responded within ${firstTokenTimeout}s per attempt`
-  );
+  // All attempts exhausted. `lastError` is what actually kept failing, which is
+  // often not a first token timeout at all (connection resets and empty upstream
+  // streams land here too), so it is what the client gets told about.
+  const lastReason = describeAttemptFailure(lastError, firstTokenTimeout);
+  logger.error(`[StreamFailed] All ${maxRetries} attempts exhausted - ${lastReason}`);
 
   if (onAllRetriesFailed) {
-    throw onAllRetriesFailed(maxRetries, firstTokenTimeout);
+    throw onAllRetriesFailed(maxRetries, firstTokenTimeout, lastError);
   }
-  throw new Error(
-    `Model did not respond within ${firstTokenTimeout}s after ${maxRetries} attempts. Please try again.`
-  );
+  throw new Error(`Upstream request failed after ${maxRetries} attempts: ${lastReason}`);
+}
+
+/**
+ * One-line explanation of why a single attempt failed, for logs and for the
+ * message handed to the API client.
+ *
+ * @param {Error|null} error - The failure of the last attempt
+ * @param {number} firstTokenTimeout - First token timeout in seconds
+ * @returns {string} Human-readable reason
+ */
+function describeAttemptFailure(error, firstTokenTimeout) {
+  if (error instanceof FirstTokenTimeoutError) {
+    return `model did not respond within ${firstTokenTimeout}s per attempt`;
+  }
+  if (error instanceof EmptyUpstreamStreamError) {
+    return 'Kiro API closed the response without sending any data';
+  }
+  if (error) {
+    const info = classifyNetworkError(error);
+    return `${info.userMessage} (${info.technicalDetails})`;
+  }
+  return 'no successful attempt and no error recorded';
 }
 
 /**
@@ -532,12 +578,14 @@ async function cancelBody(body) {
 module.exports = {
   FirstTokenTimeoutError,
   ReadTimeoutError,
+  EmptyUpstreamStreamError,
   makeKiroEvent,
   parseKiroStream,
   processChunk,
   collectStreamToResult,
   calculateTokensFromContextUsage,
   streamWithFirstTokenRetry,
+  describeAttemptFailure,
   readBodyText,
   cancelBody,
 };

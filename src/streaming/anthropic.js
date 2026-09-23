@@ -25,6 +25,7 @@ const {
   collectStreamToResult,
   calculateTokensFromContextUsage,
   streamWithFirstTokenRetry,
+  describeAttemptFailure,
 } = require('./core');
 
 const logger = new Logger();
@@ -575,13 +576,13 @@ async function* streamWithFirstTokenRetryAnthropic({
     return err;
   }
 
-  function createTimeoutError(retries, timeout) {
+  function createTimeoutError(retries, timeout, lastError) {
     const err = new Error(
       JSON.stringify({
         type: 'error',
         error: {
           type: 'timeout_error',
-          message: `Model did not respond within ${timeout}s after ${retries} attempts. Please try again.`,
+          message: `Upstream request failed after ${retries} attempts: ${describeAttemptFailure(lastError, timeout)}`,
         },
       })
     );
