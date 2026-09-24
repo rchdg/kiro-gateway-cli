@@ -82,13 +82,20 @@ async function* streamKiroToOpenAIInternal(response, {
           model,
           choices: [{ index: 0, delta, finish_reason: null }],
         });
-      } else if (event.type === 'thinking' && event.thinkingContent) {
-        fullThinkingContent += event.thinkingContent;
+      } else if (
+        (event.type === 'thinking' && event.thinkingContent) ||
+        (event.type === 'reasoning' && event.reasoningContent)
+      ) {
+        // Native upstream reasoning always belongs in reasoning_content; only the
+        // injected fake-reasoning path honours FAKE_REASONING_HANDLING.
+        const native = event.type === 'reasoning';
+        const text = native ? event.reasoningContent : event.thinkingContent;
+        fullThinkingContent += text;
 
         const delta =
-          FAKE_REASONING_HANDLING === 'as_reasoning_content'
-            ? { reasoning_content: event.thinkingContent }
-            : { content: event.thinkingContent };
+          native || FAKE_REASONING_HANDLING === 'as_reasoning_content'
+            ? { reasoning_content: text }
+            : { content: text };
 
         if (firstChunk) {
           delta.role = 'assistant';

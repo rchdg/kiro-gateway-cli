@@ -173,11 +173,14 @@ async function* streamKiroToAnthropic(response, {
             delta: { type: 'text_delta', text: content },
           });
         }
-      } else if (event.type === 'thinking') {
-        const thinkingContent = event.thinkingContent || '';
+      } else if (event.type === 'thinking' || event.type === 'reasoning') {
+        // Native upstream reasoning is always a real thinking block; only the
+        // injected fake-reasoning path honours FAKE_REASONING_HANDLING.
+        const native = event.type === 'reasoning';
+        const thinkingContent = (native ? event.reasoningContent : event.thinkingContent) || '';
         fullThinkingContent += thinkingContent;
 
-        if (FAKE_REASONING_HANDLING === 'as_reasoning_content') {
+        if (native || FAKE_REASONING_HANDLING === 'as_reasoning_content') {
           // Native Anthropic thinking content blocks
           if (!thinkingBlockStarted) {
             thinkingBlockIndex = currentBlockIndex;
@@ -458,11 +461,15 @@ async function collectAnthropicResponse(response, { model, modelCache, requestMe
   // Build content blocks
   const contentBlocks = [];
 
-  // Thinking block FIRST if there's thinking content
-  if (result.thinkingContent && FAKE_REASONING_HANDLING === 'as_reasoning_content') {
+  // Thinking block FIRST if there's thinking content. Native upstream reasoning
+  // always counts; injected fake reasoning only when the handling mode says so.
+  const thinkingText =
+    result.reasoningContent +
+    (FAKE_REASONING_HANDLING === 'as_reasoning_content' ? result.thinkingContent : '');
+  if (thinkingText) {
     contentBlocks.push({
       type: 'thinking',
-      thinking: result.thinkingContent,
+      thinking: thinkingText,
       signature: generateThinkingSignature(),
     });
   }

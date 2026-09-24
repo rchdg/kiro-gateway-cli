@@ -70,6 +70,7 @@ function makeKiroEvent({
   type,
   content = null,
   thinkingContent = null,
+  reasoningContent = null,
   toolUse = null,
   usage = null,
   contextUsagePercentage = null,
@@ -81,6 +82,7 @@ function makeKiroEvent({
     type,
     content,
     thinkingContent,
+    reasoningContent,
     toolUse,
     usage,
     contextUsagePercentage,
@@ -310,6 +312,8 @@ function processChunk(parser, chunk, thinkingParser) {
       } else {
         events.push(makeKiroEvent({ type: 'content', content }));
       }
+    } else if (event.type === 'reasoning') {
+      events.push(makeKiroEvent({ type: 'reasoning', reasoningContent: event.data }));
     } else if (event.type === 'usage') {
       events.push(makeKiroEvent({ type: 'usage', usage: event.data }));
     } else if (event.type === 'context_usage') {
@@ -337,6 +341,7 @@ async function collectStreamToResult(response, options = {}) {
   const result = {
     content: '',
     thinkingContent: '',
+    reasoningContent: '',
     toolCalls: [],
     usage: null,
     contextUsagePercentage: null,
@@ -351,6 +356,8 @@ async function collectStreamToResult(response, options = {}) {
     } else if (event.type === 'thinking' && event.thinkingContent) {
       result.thinkingContent += event.thinkingContent;
       fullContentForBracketTools += event.thinkingContent;
+    } else if (event.type === 'reasoning' && event.reasoningContent) {
+      result.reasoningContent += event.reasoningContent;
     } else if (event.type === 'tool_use' && event.toolUse) {
       result.toolCalls.push(event.toolUse);
     } else if (event.type === 'usage' && event.usage) {

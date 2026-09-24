@@ -147,6 +147,50 @@ test('AwsEventStreamParser: accumulates fragments split across chunks', () => {
   assert.equal(events2[0].data, 'hi');
 });
 
+test('AwsEventStreamParser: only adjacent duplicate content is dropped', () => {
+  const parser = new AwsEventStreamParser();
+  const chunks = buildEventStreamChunks([
+    { content: 'ok' },
+    { content: 'ok' },
+    { content: 'x' },
+    { content: 'ok' },
+  ]);
+
+  const events = [];
+  for (const chunk of chunks) {
+    events.push(...parser.feed(chunk));
+  }
+
+  // The repeat after 'x' is not adjacent, so it survives
+  assert.deepEqual(
+    events.filter((e) => e.type === 'content').map((e) => e.data),
+    ['ok', 'x', 'ok']
+  );
+});
+
+test('AwsEventStreamParser: parses native reasoningContentEvent fragments', () => {
+  const parser = new AwsEventStreamParser();
+  const chunks = buildEventStreamChunks([
+    { text: 'first ' },
+    { text: 'first ' },
+    { text: 'second' },
+    { content: 'answer' },
+  ]);
+
+  const events = [];
+  for (const chunk of chunks) {
+    events.push(...parser.feed(chunk));
+  }
+
+  const reasoning = events.filter((e) => e.type === 'reasoning').map((e) => e.data);
+  // Identical fragments are kept: reasoning repeats short tokens legitimately
+  assert.deepEqual(reasoning, ['first ', 'first ', 'second']);
+  assert.deepEqual(
+    events.filter((e) => e.type === 'content').map((e) => e.data),
+    ['answer']
+  );
+});
+
 test('AwsEventStreamParser: surfaces a CONTENT_FILTERED refusal', () => {
   const parser = new AwsEventStreamParser();
   const chunks = buildEventStreamChunks([

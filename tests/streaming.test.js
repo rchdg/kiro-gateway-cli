@@ -304,6 +304,49 @@ test('collectStreamResponse: includes reasoning_content', async () => {
 // streamKiroToAnthropic
 // ==================================================================================================
 
+test('streamKiroToOpenAI: native reasoning events become reasoning_content', async () => {
+  const response = makeResponse([
+    buildEventChunk([
+      { text: 'weighing ' },
+      { text: 'options' },
+      { content: 'the answer' },
+      { contextUsagePercentage: 10 },
+    ]),
+  ]);
+
+  const reasoning = [];
+  const content = [];
+  for await (const chunk of streamKiroToOpenAI(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+  })) {
+    const payload = chunk.slice('data:'.length).trim();
+    if (!payload || payload === '[DONE]') continue;
+    const delta = JSON.parse(payload).choices[0].delta;
+    if (delta.reasoning_content) reasoning.push(delta.reasoning_content);
+    if (delta.content) content.push(delta.content);
+  }
+
+  assert.equal(reasoning.join(''), 'weighing options');
+  assert.equal(content.join(''), 'the answer');
+});
+
+test('collectStreamResponse: native reasoning lands on reasoning_content', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ text: 'thought' }, { content: 'answer' }, { contextUsagePercentage: 10 }]),
+  ]);
+
+  const result = await collectStreamResponse(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    requestMessages: [{ role: 'user', content: 'hi' }],
+  });
+
+  assert.equal(result.choices[0].message.reasoning_content, 'thought');
+  assert.equal(result.choices[0].message.content, 'answer');
+});
+
 test('streamKiroToOpenAI: an upstream refusal becomes finish_reason content_filter', async () => {
   const response = makeResponse([
     buildEventChunk([
@@ -464,6 +507,23 @@ test('collectAnthropicResponse: forms full message', async () => {
   assert.equal(result.stop_reason, 'end_turn');
   assert.ok(result.usage.input_tokens > 0);
   assert.ok(result.usage.output_tokens > 0);
+});
+
+test('collectAnthropicResponse: native reasoning becomes a thinking block', async () => {
+  const response = makeResponse([
+    buildEventChunk([{ text: 'deliberating' }, { content: 'answer' }, { contextUsagePercentage: 10 }]),
+  ]);
+
+  const result = await collectAnthropicResponse(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    requestMessages: [{ role: 'user', content: 'Hi' }],
+  });
+
+  assert.equal(result.content[0].type, 'thinking');
+  assert.equal(result.content[0].thinking, 'deliberating');
+  assert.equal(result.content[1].type, 'text');
+  assert.equal(result.content[1].text, 'answer');
 });
 
 test('collectAnthropicResponse: an upstream refusal becomes stop_reason refusal', async () => {

@@ -11,7 +11,10 @@
  * Mirrors `kiro/parsers.py`.
  */
 
+const { Logger } = require('./logger');
 const { generateToolCallId } = require('./utils');
+
+const logger = new Logger();
 
 /**
  * Finds the position of the closing brace considering nesting and strings.
@@ -179,6 +182,9 @@ class AwsEventStreamParser {
   // Patterns for finding JSON events
   static EVENT_PATTERNS = [
     ['{"content":', 'content'],
+    // reasoningContentEvent: the model's real chain of thought, streamed in
+    // `text` fragments alongside the answer. No prompt injection needed.
+    ['{"text":', 'reasoning'],
     ['{"name":', 'tool_start'],
     ['{"input":', 'tool_input'],
     ['{"stop":', 'tool_stop'],
@@ -250,6 +256,8 @@ class AwsEventStreamParser {
     switch (eventType) {
       case 'content':
         return this._processContentEvent(data);
+      case 'reasoning':
+        return this._processReasoningEvent(data);
       case 'tool_start':
         return this._processToolStartEvent(data);
       case 'tool_input':
@@ -305,12 +313,38 @@ class AwsEventStreamParser {
     // Skip followupPrompt
     if (data.followupPrompt) return null;
 
-    // Deduplicate repeating content
-    if (content === this.lastContent) return null;
+    // Drop a fragment identical to the one right before it. Kiro sometimes
+    // retransmits an assistantResponseEvent and there is no sequence number or
+    // id on the event to tell a retransmission from a genuine repeat, so this
+    // stays a heuristic: a model that legitimately emits the same fragment
+    // twice in a row would lose one copy. Kiro batches several tokens per
+    // fragment, which makes that unlikely in practice (repetition-heavy prompts
+    // such as "write ok on 12 lines" produce no adjacent duplicates), but log
+    // it so a future case of lost text is diagnosable instead of invisible.
+    if (content === this.lastContent) {
+      logger.debug(`Dropped a content fragment identical to the previous one: ${JSON.stringify(content)}`);
+      return null;
+    }
 
     this.lastContent = content;
 
     return { type: 'content', data: content };
+  }
+
+  /**
+   * Processes a reasoningContentEvent.
+   *
+   * Unlike content, identical consecutive fragments are kept: the chain of
+   * thought legitimately repeats short tokens and there is no id to tell a
+   * retransmission from a genuine repeat.
+   *
+   * @param {object} data - Event data
+   * @returns {{type: string, data: string}|null} Reasoning event or null
+   */
+  _processReasoningEvent(data) {
+    const text = typeof data.text === 'string' ? data.text : '';
+    if (!text) return null;
+    return { type: 'reasoning', data: text };
   }
 
   /**
