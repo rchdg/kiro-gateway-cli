@@ -32,11 +32,19 @@ node bin/kiro-gateway.js serve --port 9000
 node bin/kiro-gateway.js --host 127.0.0.1 --port 9000
 
 # 后台运行（守护进程）——立即返回
+kiro-gateway start
+kiro-gateway start --port 9000
 kiro-gateway serve --background
 kiro-gateway serve -b --port 9000
 
+# 查看后台服务器运行状态（未运行时退出码为 1）
+kiro-gateway status
+
 # 停止后台服务器（需在同一个目录下运行）
 kiro-gateway stop
+
+# 升级到最新发布版本（底层执行 npm i -g kiro-gateway-cli）
+kiro-gateway update
 
 # 全局安装（添加 kiro-gateway 命令）
 npm link
@@ -75,28 +83,70 @@ kiro-gateway serve \
 
 ### 后台运行
 
-`serve --background`（或 `-b`）会把服务器作为分离的守护进程启动，然后立即返回。父进程会等待服务器健康检查通过（/health 端点）并打印结果。
+三个子命令管理后台服务器：`start`（启动）、`status`（查看状态）、`stop`（停止）。
+`serve --background`（或 `-b`）与 `start` 等价，会把服务器作为分离的守护进程启动，然后立即返回。父进程会等待服务器健康检查通过（/health 端点）并打印结果。
 
 ```bash
-kiro-gateway serve --background --port 9000
+kiro-gateway start --port 9000
 # Starting server in the background (pid 12345)...
 # Server is running in the background: http://127.0.0.1:9000/health
+# Check it with: kiro-gateway status
 # Stop it with: kiro-gateway stop
+
+kiro-gateway status
+# Kiro Gateway is running in the background (pid 12345).
+#   Health:   http://127.0.0.1:9000/health (healthy)
+#   PID file: .kiro-gateway.pid
+#   Log file: kiro-gateway.log
+#   Stop it with: kiro-gateway stop
 
 kiro-gateway stop
 # Background server stopped (pid 12345).
 ```
 
-守护进程状态文件（相对于工作目录，所以 `stop` 必须在启动 `serve --background` 的同一个目录下运行）：
+`status` 的退出码：后台服务器在运行时为 `0`，未运行（无 pid 文件、进程已死或 pid 文件损坏）时为 `1`，方便脚本判断。健康检查使用当前配置的 `--host` / `--port`，所以如果后台服务器是用其他端口启动的，请用同样的 `--port` 运行 `status`，否则只会显示进程存活但 health 不响应。
+
+守护进程状态文件（相对于工作目录，所以 `status` / `stop` 必须在启动后台服务器的同一个目录下运行）：
 
 - `.kiro-gateway.pid` - 后台服务器的 PID（可用 `KIRO_PID_FILE` 覆盖）
 - `kiro-gateway.log` - 守护进程输出日志（可用 `KIRO_LOG_FILE` 覆盖）
 
 启动前 CLI 会检查目标端口是否空闲，如果已有其他服务在监听，会报错并给出可操作的提示。如果后台服务器在启动过程中退出（凭据错误、端口冲突等），CLI 会报告失败并显示日志末尾几行。
 
-### Windows 平台说明
+### 升级版本
 
-后台运行在 Windows 上同样可用：子进程以无控制台窗口（`windowsHide`）方式启动，并自行把输出重定向到日志文件（Win32 不能通过 `stdio` 继承任意文件描述符）。一个注意点：Windows 没有 POSIX 信号，所以 `kiro-gateway stop` 会直接终止后台进程，而不会触发它的优雅退出处理器。pid 文件仍由 `stop` 清理，且每次 `start`/`stop` 都会校验 pid 文件对应的进程状态，非优雅终止也是安全的。
+`update` 会先查询 npm registry 上的最新版本，然后执行全局安装：
+
+```bash
+kiro-gateway update
+# Updating kiro-gateway v1.7.0 -> v1.8.0...
+# Updated kiro-gateway to v1.8.0.
+
+# 已是最新版本时不会重复安装
+kiro-gateway update
+# kiro-gateway is already up to date (v1.8.0).
+```
+
+实际执行的命令是 `npm install -g kiro-gateway-cli@latest`。如果查询 registry 失败（离线、代理等），会直接安装最新版本，效果等同于手动执行该命令。
+
+### 跨平台说明（macOS / Windows / Linux）
+
+三平台都支持后台运行，行为差异如下：
+
+| 项目 | macOS / Linux | Windows |
+| --- | --- | --- |
+| 启动方式 | 分离的守护进程，父进程退出后继续运行 | 同上，额外使用 `windowsHide` 隐藏控制台窗口 |
+| 日志 | 子进程自己打开日志文件并接管 stdout/stderr | 同上（Win32 不能通过 `stdio` 继承任意文件描述符） |
+| `stop` 语义 | 先发 `SIGTERM` 让服务器优雅关闭，8 秒未退出则 `SIGKILL` | 直接终止进程（Windows 没有 POSIX 信号，不会执行优雅退出处理器） |
+| pid 文件清理 | 子进程优雅退出或 `stop` 时删除，删除失败会重试 | `stop` 父进程删除；遇到杀软/索引器占用会重试最多 6 次 |
+| 权限不足 | 提示可能需要 `sudo` | 提示从同样权限（管理员）的命令行执行 |
+
+注意点：
+
+- `status` / `stop` 依据工作目录下的 pid 文件，必须在启动后台服务器的同一个目录运行。
+- 无论哪个平台，`start` / `stop` / `status` 都会校验 pid 文件对应的进程是否存活，残留的 pid 文件会被自动清理，非优雅终止也是安全的。
+- IPv4 与 IPv6 都支持：`--host ::1` 时展示和探测的地址会自动加方括号（`http://[::1]:8000/health`），`--host ::` 会探测 `::1`。
+- 启动失败时（端口占用、地址不可用、凭据错误），父进程会打印日志尾部并清理 pid 文件，不会留下“幽灵”状态。
 
 ## 配置
 
@@ -114,8 +164,8 @@ kiro-gateway stop
 | `SERVER_HOST` / `SERVER_PORT` | 服务器监听地址 |
 | `VPN_PROXY_URL` | 受限网络下的代理：HTTP/HTTPS 或 SOCKS（`socks5://`、代理侧 DNS 用 `socks5h://`、`socks4a://`） |
 | `LOG_LEVEL` | `DEBUG`、`INFO`、`WARNING`、`ERROR`（默认：`INFO`） |
-| `KIRO_PID_FILE` | `--background` 模式的 PID 文件（默认：`.kiro-gateway.pid`） |
-| `KIRO_LOG_FILE` | `--background` 模式的日志文件（默认：`kiro-gateway.log`） |
+| `KIRO_PID_FILE` | 后台模式的 PID 文件（默认：`.kiro-gateway.pid`） |
+| `KIRO_LOG_FILE` | 后台模式的日志文件（默认：`kiro-gateway.log`） |
 | `ACCOUNT_SYSTEM` | 启用多账号故障切换（`true`/`false`） |
 | `FAKE_REASONING` | 通过标签注入实现扩展思考（默认：**关闭**）。Kiro 服务端会拦截思维链提取：模型一旦开始输出 `<thinking>` 块，该轮就以 `CONTENT_FILTERED` / `REASONING_EXTRACTION` 被终止，答案丢失。设为 `1` 可自行承担风险开启 |
 | `FIRST_TOKEN_TIMEOUT` | 重试前等待首个 token 的时间（默认：15 秒） |

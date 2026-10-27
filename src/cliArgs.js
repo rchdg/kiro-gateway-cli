@@ -9,7 +9,7 @@
  */
 
 // Subcommands supported by the CLI
-const COMMANDS = ['serve', 'stop'];
+const COMMANDS = ['serve', 'start', 'status', 'stop', 'update'];
 
 const FLAG_DEFS = [
   { flags: ['-H', '--host'], env: 'SERVER_HOST', help: 'Server host address' },
@@ -125,6 +125,13 @@ function parseCliArgs(argv) {
         throw new CliError(`Invalid value for ${arg}: '${value}' is not a number.`);
       }
       if (def.env === 'SERVER_PORT') {
+        // Validate here so an out-of-range port fails with a readable message
+        // instead of a RangeError from net.listen() after startup work.
+        if (parsed < 1 || parsed > 65535) {
+          throw new CliError(
+            `Invalid value for ${arg}: port must be between 1 and 65535 (got ${parsed}).`
+          );
+        }
         result.port = parsed;
       }
     }
@@ -153,11 +160,17 @@ function buildHelpText(appTitle, appVersion, appDescription) {
     appDescription,
     '',
     'Usage: kiro-gateway [serve] [options]',
+    '       kiro-gateway start [options]',
+    '       kiro-gateway status',
     '       kiro-gateway stop',
+    '       kiro-gateway update',
     '',
     'Commands:',
-    '  serve                      Start the proxy gateway server (default)',
-    '  stop                       Stop the background server started with --background',
+    '  serve                      Start the proxy gateway server in the foreground (default)',
+    '  start                      Start the server in the background (same as serve --background)',
+    '  status                     Show whether the background server is running (exit 1 when stopped)',
+    '  stop                       Stop the background server started with start/--background',
+    '  update                     Upgrade to the latest version from npm',
     '',
     'Options:',
     ...FLAG_DEFS.map((def) => {

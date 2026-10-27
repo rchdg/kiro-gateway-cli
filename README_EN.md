@@ -34,11 +34,19 @@ node bin/kiro-gateway.js serve --port 9000
 node bin/kiro-gateway.js --host 127.0.0.1 --port 9000
 
 # Run in the background (daemon) - returns immediately
+kiro-gateway start
+kiro-gateway start --port 9000
 kiro-gateway serve --background
 kiro-gateway serve -b --port 9000
 
+# Show the background server status (exit code 1 when not running)
+kiro-gateway status
+
 # Stop the background server (run from the same directory)
 kiro-gateway stop
+
+# Upgrade to the latest published version (runs npm i -g kiro-gateway-cli)
+kiro-gateway update
 
 # Global install (adds the `kiro-gateway` command)
 npm link
@@ -79,22 +87,37 @@ starts the server the same way.
 
 ### Running in the background
 
-`serve --background` (or `-b`) starts the server as a detached daemon and
-returns immediately. The parent waits for the server to become healthy
-(health endpoint) and prints the result.
+Three subcommands manage the background server: `start`, `status` and `stop`.
+`serve --background` (or `-b`) is equivalent to `start`: it starts the server
+as a detached daemon and returns immediately. The parent waits for the server
+to become healthy (health endpoint) and prints the result.
 
 ```bash
-kiro-gateway serve --background --port 9000
+kiro-gateway start --port 9000
 # Starting server in the background (pid 12345)...
 # Server is running in the background: http://127.0.0.1:9000/health
+# Check it with: kiro-gateway status
 # Stop it with: kiro-gateway stop
+
+kiro-gateway status
+# Kiro Gateway is running in the background (pid 12345).
+#   Health:   http://127.0.0.1:9000/health (healthy)
+#   PID file: .kiro-gateway.pid
+#   Log file: kiro-gateway.log
+#   Stop it with: kiro-gateway stop
 
 kiro-gateway stop
 # Background server stopped (pid 12345).
 ```
 
-Daemon state files (relative to the working directory, so `stop` must be run
-from the same directory as `serve --background`):
+`status` exits with `0` while the background server is running and with `1`
+when it is not (missing pid file, dead process, corrupted pid file), which
+makes it usable in scripts. The health probe uses the configured
+`--host` / `--port`, so pass the same `--port` the server was started with;
+otherwise the process is reported as alive but the health check fails.
+
+Daemon state files (relative to the working directory, so `status` and `stop`
+must be run from the same directory as the start command):
 
 - `.kiro-gateway.pid` - PID of the background server (override: `KIRO_PID_FILE`)
 - `kiro-gateway.log` - daemon output (override: `KIRO_LOG_FILE`)
@@ -104,16 +127,48 @@ an actionable message when another service is already listening there. If the
 background server exits during startup (bad credentials, port conflict), the
 CLI reports the failure and shows the last log lines.
 
-### Platform notes (Windows)
+### Upgrading
 
-The daemon works on Windows too: the child is spawned without a console
-window (`windowsHide`) and redirects its output to the log file itself
-(Win32 cannot inherit arbitrary file descriptors via `stdio`). One caveat:
-Windows has no POSIX signals, so `kiro-gateway stop` terminates the
-background process directly instead of triggering its graceful shutdown
-handler. The pid file is still cleaned up by `stop`, and ungraceful
-termination is safe because the pid file is validated against the process
-state on every `start`/`stop`.
+`update` checks the npm registry for the latest version and then performs a
+global install:
+
+```bash
+kiro-gateway update
+# Updating kiro-gateway v1.7.0 -> v1.8.0...
+# Updated kiro-gateway to v1.8.0.
+
+# Nothing is installed when already up to date
+kiro-gateway update
+# kiro-gateway is already up to date (v1.8.0).
+```
+
+The command runs `npm install -g kiro-gateway-cli@latest`. If the registry
+lookup fails (offline, proxy, ...), it installs the latest version anyway,
+which is the same as running that command manually.
+
+### Platform notes (macOS / Windows / Linux)
+
+The background mode works on all three platforms. Differences:
+
+| Aspect | macOS / Linux | Windows |
+| --- | --- | --- |
+| Start | Detached daemon that survives the parent exit | Same, plus `windowsHide` so no console window flashes up |
+| Logging | The child opens the log file itself and takes over stdout/stderr | Same (Win32 cannot inherit arbitrary file descriptors via `stdio`) |
+| `stop` | `SIGTERM` first so the server shuts down gracefully; `SIGKILL` after 8s | Terminates the process directly (no POSIX signals, so shutdown handlers never run) |
+| pid file cleanup | Removed by the child on graceful exit or by `stop`, with retries | Removed by `stop`; retried up to 6 times when antivirus/indexers hold the file |
+| Permission error | Suggests `sudo` | Suggests running from an elevated prompt |
+
+Caveats:
+
+- `status` and `stop` rely on the pid file in the working directory, so run them
+  from the same directory the server was started in.
+- On every platform `start`/`stop`/`status` validate the pid file against the
+  live process; stale pid files are removed automatically, so ungraceful
+  termination is safe.
+- IPv4 and IPv6 both work: `--host ::1` is printed and probed with brackets
+  (`http://[::1]:8000/health`), and `--host ::` probes `::1`.
+- When startup fails (port taken, address unavailable, bad credentials) the
+  parent prints the log tail and removes the pid file, leaving no ghost state.
 
 ## Configuration
 
@@ -132,8 +187,8 @@ environment variables:
 | `SERVER_HOST` / `SERVER_PORT` | Server binding |
 | `VPN_PROXY_URL` | Proxy for restricted networks: HTTP/HTTPS or SOCKS (`socks5://`, `socks5h://` for proxy-side DNS, `socks4a://`) |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
-| `KIRO_PID_FILE` | PID file for `--background` mode (default: `.kiro-gateway.pid`) |
-| `KIRO_LOG_FILE` | Log file for `--background` mode (default: `kiro-gateway.log`) |
+| `KIRO_PID_FILE` | PID file for background mode (default: `.kiro-gateway.pid`) |
+| `KIRO_LOG_FILE` | Log file for background mode (default: `kiro-gateway.log`) |
 | `ACCOUNT_SYSTEM` | Enable multi-account failover (`true`/`false`) |
 | `FAKE_REASONING` | Extended thinking via tag injection (default: **disabled**). Kiro blocks reasoning extraction server-side: once the model opens a `<thinking>` block the turn comes back as `CONTENT_FILTERED` / `REASONING_EXTRACTION` and the answer is lost. Set to `1` to opt in at your own risk |
 | `FIRST_TOKEN_TIMEOUT` | First-token wait before retry (default: 15s) |

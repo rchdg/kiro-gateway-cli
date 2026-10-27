@@ -37,6 +37,24 @@ test('splitCommand: stop subcommand is extracted', () => {
   assert.deepEqual(args, []);
 });
 
+test('splitCommand: start subcommand is extracted', () => {
+  const { command, args } = splitCommand(['start', '--port', '9000']);
+  assert.equal(command, 'start');
+  assert.deepEqual(args, ['--port', '9000']);
+});
+
+test('splitCommand: status subcommand is extracted', () => {
+  const { command, args } = splitCommand(['status']);
+  assert.equal(command, 'status');
+  assert.deepEqual(args, []);
+});
+
+test('splitCommand: update subcommand is extracted', () => {
+  const { command, args } = splitCommand(['update']);
+  assert.equal(command, 'update');
+  assert.deepEqual(args, []);
+});
+
 test('parseCliArgs: no arguments returns defaults', () => {
   const args = parseCliArgs([]);
   assert.equal(args.host, null);
@@ -139,6 +157,8 @@ test('buildHelpText: documents all common options', () => {
   assert.ok(help.includes('stop'));
   assert.ok(help.includes('Usage: kiro-gateway [serve] [options]'));
   assert.ok(help.includes('kiro-gateway stop'));
+  assert.ok(help.includes('kiro-gateway status'));
+  assert.ok(help.includes('kiro-gateway update'));
   assert.ok(help.includes('--background'));
   assert.ok(help.includes('--api-key'));
   assert.ok(help.includes('--refresh-token'));
@@ -149,4 +169,30 @@ test('buildHelpText: documents all common options', () => {
   assert.ok(help.includes('--proxy-url'));
   assert.ok(help.includes('--account-system'));
   assert.ok(help.includes('1. CLI arguments'));
+});
+// ==================================================================================================
+// --port range validation
+// ==================================================================================================
+
+test('parseCliArgs: accepts the valid port range', () => {
+  assert.equal(parseCliArgs(['--port', '1']).port, 1);
+  assert.equal(parseCliArgs(['--port', '8000']).port, 8000);
+  assert.equal(parseCliArgs(['--port', '65535']).port, 65535);
+});
+
+test('parseCliArgs: rejects out-of-range ports before startup', () => {
+  for (const value of ['0', '-1', '65536', '99999']) {
+    assert.throws(
+      () => parseCliArgs(['--port', value]),
+      (err) => err instanceof CliError && /between 1 and 65535/.test(err.message),
+      `port ${value} should be rejected`
+    );
+  }
+});
+
+test('parseCliArgs: rejects a non-numeric port', () => {
+  assert.throws(
+    () => parseCliArgs(['--port', 'abc']),
+    (err) => err instanceof CliError && /not a number/.test(err.message)
+  );
 });

@@ -111,7 +111,11 @@ function classifyError(statusCode, reason) {
   }
 
   if (statusCode >= 500 && statusCode < 600) {
-    return ErrorType.FATAL;
+    // Upstream 5xx is usually specific to the account/host that served it
+    // (or a transient upstream hiccup), not to the request itself. Treating it
+    // as FATAL throws away the multi-account failover that exists precisely
+    // for this case, so the client sees a 5xx while healthy accounts idle.
+    return ErrorType.RECOVERABLE;
   }
 
   return ErrorType.FATAL;

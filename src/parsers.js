@@ -102,8 +102,13 @@ function parseBracketToolCalls(responseText) {
           arguments: JSON.stringify(args),
         },
       });
-    } catch {
-      // Failed to parse arguments - skip this call
+    } catch (err) {
+      // Failed to parse arguments - skip this call, but leave a trace: an
+      // upstream change here silently drops a tool call the model emitted.
+      logger.debug(
+        `Skipped tool call with unparseable arguments (${jsonStr.length} bytes): ` +
+          `${err.message}; starts with: ${jsonStr.slice(0, 120)}`
+      );
     }
   }
 
@@ -179,6 +184,11 @@ class AwsEventStreamParser {
     this.toolCalls = [];
   }
 
+  // Stop reasons Kiro reports for a turn that ended the way the client asked.
+  // Anything else (CONTENT_FILTERED, REASONING_EXTRACTION, …) means upstream
+  // cut the turn short.
+  static BENIGN_STOP_REASONS = new Set(['END_TURN', 'TOOL_USE', 'MAX_TOKENS', 'STOP_SEQUENCE']);
+
   // Patterns for finding JSON events
   static EVENT_PATTERNS = [
     ['{"content":', 'content'],
@@ -191,9 +201,10 @@ class AwsEventStreamParser {
     ['{"followupPrompt":', 'followup'],
     ['{"usage":', 'usage'],
     ['{"contextUsagePercentage":', 'context_usage'],
-    // metadataEvent: Kiro aborts the turn here (e.g. stopReason CONTENT_FILTERED
-    // with a REASONING_EXTRACTION refusal). Without this the turn silently
-    // looks like a short but successful answer.
+    // metadataEvent: every finished turn reports stopReason here. Normal stops
+    // (TOOL_USE, MAX_TOKENS, …) become stop_reason events; only abnormal ones
+    // (e.g. CONTENT_FILTERED with a REASONING_EXTRACTION refusal) become
+    // refusals. Without this the turn silently looks like a short answer.
     ['{"stopDetails":', 'stop_details'],
     ['{"stopReason":', 'stop_details'],
   ];
@@ -237,8 +248,14 @@ class AwsEventStreamParser {
         if (event) {
           events.push(event);
         }
-      } catch {
-        // Malformed JSON - skip this fragment
+      } catch (err) {
+        // Dropping a fragment silently turns an upstream format change into a
+        // response that just stops mid-way with nothing in the logs. Keep the
+        // size and a short prefix so the cause is visible at debug level.
+        logger.debug(
+          `Skipped malformed SSE fragment (${jsonStr.length} bytes, type=${earliestType || 'unknown'}): ` +
+            `${err.message}; starts with: ${jsonStr.slice(0, 120)}`
+        );
       }
     }
 
@@ -278,27 +295,35 @@ class AwsEventStreamParser {
   /**
    * Processes a metadataEvent carrying stop details.
    *
-   * Kiro ends a turn early with `stopReason` (e.g. `CONTENT_FILTERED`) and an
-   * optional `stopDetails.refusal`. Only abnormal stops produce an event; a
-   * plain `stopReason: "END_TURN"` is not worth reporting.
+   * Kiro reports `stopReason` on every finished turn, including normal ones
+   * (`TOOL_USE` when the model asks for a tool, `MAX_TOKENS` when it hit the
+   * output limit). Only abnormal stops become `refusal` events — treating a
+   * normal stop as a refusal makes every tool-using turn look cut short.
    *
    * @param {object} data - Event data
-   * @returns {{type: string, data: object}|null} Refusal event or null
+   * @returns {{type: string, data: object}|null} Refusal/stop event or null
    */
   _processStopDetailsEvent(data) {
     const stopReason = typeof data.stopReason === 'string' ? data.stopReason : null;
     const refusal = (data.stopDetails && data.stopDetails.refusal) || null;
 
-    if (!refusal && (!stopReason || stopReason === 'END_TURN')) return null;
+    if (refusal) {
+      return {
+        type: 'refusal',
+        data: {
+          stopReason,
+          category: refusal.category || null,
+          explanation: refusal.explanation || null,
+        },
+      };
+    }
 
-    return {
-      type: 'refusal',
-      data: {
-        stopReason,
-        category: (refusal && refusal.category) || null,
-        explanation: (refusal && refusal.explanation) || null,
-      },
-    };
+    if (!stopReason) return null;
+    if (AwsEventStreamParser.BENIGN_STOP_REASONS.has(stopReason)) {
+      return { type: 'stop_reason', data: stopReason };
+    }
+
+    return { type: 'refusal', data: { stopReason, category: null, explanation: null } };
   }
 
   /**

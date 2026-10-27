@@ -15,7 +15,7 @@ const undici = require('undici');
 process.env.PROXY_API_KEY = 'test-proxy-key';
 
 const { AccountManager } = require('../src/accountManager');
-const { createServer } = require('../src/server');
+const { createServer, writeWithBackpressure } = require('../src/server');
 const { PROXY_API_KEY } = require('../src/config');
 
 // ==================================================================================================
@@ -236,6 +236,22 @@ test('POST /v1/chat/completions rejects missing API key', async () => {
   assert.equal(res.status, 401);
 });
 
+test('API key comparison tolerates a different prefix length', async () => {
+  // The comparison hashes both sides, so a key that shares a prefix but
+  // differs in length must still be rejected (not throw).
+  const res = await requestJson('GET', '/v1/models', {
+    headers: { Authorization: 'Bearer test-proxy' },
+  });
+  assert.equal(res.status, 401);
+});
+
+test('API key comparison accepts a bearer header with different casing', async () => {
+  const res = await requestJson('GET', '/v1/models', {
+    headers: { Authorization: `bearer ${PROXY_API_KEY}` },
+  });
+  assert.equal(res.status, 200);
+});
+
 // ==================================================================================================
 // Models
 // ==================================================================================================
@@ -384,4 +400,60 @@ test('POST /v1/messages formats upstream errors in Anthropic format', async () =
   } finally {
     failChatRequests = false;
   }
+});
+// ==================================================================================================
+// Backpressure
+// ==================================================================================================
+
+const EventEmitter = require('node:events');
+
+function makeFakeResponse({ writeReturns }) {
+  const res = new EventEmitter();
+  const written = [];
+  res.writableEnded = false;
+  res.destroyed = false;
+  res.write = (chunk) => {
+    written.push(chunk);
+    return writeReturns;
+  };
+  return { res, written };
+}
+
+test('writeWithBackpressure: writes without waiting when the buffer accepts it', async () => {
+  const { res, written } = makeFakeResponse({ writeReturns: true });
+
+  await writeWithBackpressure(res, 'chunk');
+  assert.deepEqual(written, ['chunk']);
+  assert.equal(res.listenerCount('drain'), 0, 'no drain listener should linger');
+});
+
+test('writeWithBackpressure: waits for drain when the socket buffer is full', async () => {
+  const { res, written } = makeFakeResponse({ writeReturns: false });
+
+  let settled = false;
+  const pending = writeWithBackpressure(res, 'chunk').then(() => {
+    settled = true;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'must not resolve while the buffer is full');
+  assert.deepEqual(written, ['chunk']);
+
+  res.emit('drain');
+  await pending;
+  assert.equal(settled, true);
+  assert.equal(res.listenerCount('drain'), 0, 'drain listener should be removed');
+});
+
+test('writeWithBackpressure: releases when the client disconnects mid-write', async () => {
+  const { res } = makeFakeResponse({ writeReturns: false });
+
+  const pending = writeWithBackpressure(res, 'chunk');
+  res.destroyed = true;
+  res.emit('close');
+
+  // Must resolve instead of hanging on a 'drain' that will never arrive.
+  await pending;
+  assert.equal(res.listenerCount('drain'), 0);
+  assert.equal(res.listenerCount('close'), 0);
 });

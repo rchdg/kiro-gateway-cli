@@ -349,10 +349,17 @@ class KiroAuthManager {
 
   /**
    * Saves updated credentials to a JSON file (preserving other fields).
+   *
+   * The write is atomic: the new content goes to a temp file in the same
+   * directory and is then renamed over the target. A plain truncate-and-write
+   * loses the refresh token if the process dies mid-write (hard stop on
+   * Windows, power loss, OOM kill), and that token cannot be recovered.
+   * The file holds credentials, so it is created with 0600 permissions.
    */
   _saveCredentialsToFile() {
     if (!this._credsFile) return;
 
+    let tempFile = null;
     try {
       let existingData = {};
       if (fs.existsSync(this._credsFile)) {
@@ -368,10 +375,31 @@ class KiroAuthManager {
         existingData.profileArn = this._profileArn;
       }
 
-      fs.writeFileSync(this._credsFile, JSON.stringify(existingData, null, 2));
+      // Same directory => same filesystem, so rename() is atomic. A shared
+      // temp name keeps concurrent writers from leaving orphans behind.
+      tempFile = `${this._credsFile}.tmp`;
+      fs.writeFileSync(tempFile, JSON.stringify(existingData, null, 2), { mode: 0o600 });
+      fs.renameSync(tempFile, this._credsFile);
+      tempFile = null;
+
+      // rename() preserves the temp file's mode, but an existing target may
+      // have been created earlier with looser permissions.
+      try {
+        fs.chmodSync(this._credsFile, 0o600);
+      } catch {
+        // Windows has no POSIX modes; the ACL already limits access.
+      }
+
       logger.debug(`Credentials saved to ${this._credsFile}`);
     } catch (err) {
       logger.error(`Error saving credentials: ${err.message}`);
+      if (tempFile) {
+        try {
+          fs.unlinkSync(tempFile);
+        } catch {
+          // best-effort cleanup
+        }
+      }
     }
   }
 
@@ -699,11 +727,29 @@ class KiroAuthManager {
   /**
    * Forces a token refresh (used on 403 responses).
    *
+   * Shares the in-flight refresh promise with getAccessToken so that N
+   * concurrent 403s trigger exactly one refresh. Without this, Kiro accounts
+   * that rotate the refresh token invalidate each other's requests: the last
+   * refresh wins and every earlier caller ends up holding a dead token, which
+   * shows up as a sporadic 401/403 loop under load.
+   *
    * @returns {Promise<string>} The new access token
    */
   async forceRefresh() {
-    await this._refreshTokenRequest();
-    return this._accessToken;
+    if (this._refreshPromise) {
+      return this._refreshPromise;
+    }
+
+    this._refreshPromise = (async () => {
+      await this._refreshTokenRequest();
+      return this._accessToken;
+    })();
+
+    try {
+      return await this._refreshPromise;
+    } finally {
+      this._refreshPromise = null;
+    }
   }
 
   /** @returns {string|null} AWS CodeWhisperer profile ARN */

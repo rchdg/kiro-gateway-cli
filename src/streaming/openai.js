@@ -63,6 +63,7 @@ async function* streamKiroToOpenAIInternal(response, {
   let fullThinkingContent = '';
   let toolCallsFromStream = [];
   let refusal = null;
+  let upstreamStopReason = null;
 
   try {
     for await (const event of parseKiroStream(response, { firstTokenTimeout })) {
@@ -118,6 +119,8 @@ async function* streamKiroToOpenAIInternal(response, {
       } else if (event.type === 'refusal' && event.refusal) {
         refusal = event.refusal;
         logRefusal(event.refusal);
+      } else if (event.type === 'stop_reason') {
+        upstreamStopReason = event.stopReason;
       }
     }
 
@@ -145,7 +148,7 @@ async function* streamKiroToOpenAIInternal(response, {
     let finishReason;
     if (refusal) {
       finishReason = 'content_filter';
-    } else if (contentWasTruncated) {
+    } else if (upstreamStopReason === 'MAX_TOKENS' || contentWasTruncated) {
       finishReason = 'length';
     } else if (allToolCalls.length > 0) {
       finishReason = 'tool_calls';

@@ -96,6 +96,7 @@ async function* streamKiroToAnthropic(response, {
   let fullContent = '';
   let fullThinkingContent = '';
   let refusal = null;
+  let upstreamStopReason = null;
   // Anthropic requires input_tokens in message_start, but Kiro provides
   // accurate context_usage only at the end. Use fallback estimation.
   if (requestMessages || requestTools || requestSystem) {
@@ -276,6 +277,8 @@ async function* streamKiroToAnthropic(response, {
       } else if (event.type === 'refusal' && event.refusal) {
         refusal = event.refusal;
         logRefusal(event.refusal);
+      } else if (event.type === 'stop_reason') {
+        upstreamStopReason = event.stopReason;
       }
     }
 
@@ -397,7 +400,7 @@ async function* streamKiroToAnthropic(response, {
     let stopReason;
     if (refusal) {
       stopReason = 'refusal';
-    } else if (contentWasTruncated) {
+    } else if (upstreamStopReason === 'MAX_TOKENS' || contentWasTruncated) {
       stopReason = 'max_tokens';
     } else if (toolBlocks.length > 0) {
       stopReason = 'tool_use';
@@ -535,7 +538,7 @@ async function collectAnthropicResponse(response, { model, modelCache, requestMe
   let stopReason;
   if (result.refusal) {
     stopReason = 'refusal';
-  } else if (contentWasTruncated) {
+  } else if (result.stopReason === 'MAX_TOKENS' || contentWasTruncated) {
     stopReason = 'max_tokens';
   } else if (result.toolCalls.length > 0) {
     stopReason = 'tool_use';

@@ -14,6 +14,7 @@
  */
 
 const express = require('express');
+const crypto = require('node:crypto');
 const { Logger } = require('./logger');
 const {
   ApiError,
@@ -43,6 +44,7 @@ const {
   APP_VERSION,
   APP_TITLE,
   APP_DESCRIPTION,
+  MAX_REQUEST_BODY_SIZE,
 } = require('./config');
 
 const logger = new Logger();
@@ -146,11 +148,29 @@ function createServer({ accountManager, accountSystem = false }) {
   const app = express();
 
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '25mb' }));
+  app.use(express.json({ limit: MAX_REQUEST_BODY_SIZE }));
 
   // ==================================================================================================
   // Authentication
   // ==================================================================================================
+
+  /**
+   * Compares a presented API key against the configured one in constant time.
+   *
+   * A plain `!==` returns as soon as the first byte differs, which leaks the
+   * length of the shared prefix to an attacker able to time the responses.
+   * Both sides are hashed first so the comparison is length-independent and
+   * no length information leaks either.
+   *
+   * @param {string} presented - Key supplied by the client
+   * @returns {boolean} True when the key matches
+   */
+  function apiKeyMatches(presented) {
+    if (typeof presented !== 'string' || !PROXY_API_KEY) return false;
+    const a = crypto.createHash('sha256').update(presented).digest();
+    const b = crypto.createHash('sha256').update(PROXY_API_KEY).digest();
+    return crypto.timingSafeEqual(a, b);
+  }
 
   /**
    * Verifies the API key for OpenAI endpoints (Authorization: Bearer).
@@ -165,7 +185,7 @@ function createServer({ accountManager, accountSystem = false }) {
   function verifyOpenAIKey(req, res, next) {
     if (!PROXY_API_KEY) return next();
     const authHeader = req.headers.authorization || '';
-    if (authHeader !== `Bearer ${PROXY_API_KEY}`) {
+    if (!apiKeyMatches(authHeader.replace(/^Bearer\s+/i, ''))) {
       logger.warning('Access attempt with invalid API key (OpenAI endpoint)');
       return sendOpenAIError(res, 401, 'Invalid or missing API Key');
     }
@@ -187,7 +207,10 @@ function createServer({ accountManager, accountSystem = false }) {
     const xApiKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization || '';
 
-    if (xApiKey === PROXY_API_KEY || authorization === `Bearer ${PROXY_API_KEY}`) {
+    if (
+      apiKeyMatches(xApiKey) ||
+      apiKeyMatches(authorization.replace(/^Bearer\s+/i, ''))
+    ) {
       return next();
     }
 
@@ -600,7 +623,7 @@ function createServer({ accountManager, accountSystem = false }) {
       return sendOpenAIError(res, 400, 'Invalid JSON in request body.');
     }
     if (err && err.type === 'entity.too.large') {
-      const message = 'Request body too large. Maximum payload size is 25MB.';
+      const message = `Request body too large. Maximum payload size is ${MAX_REQUEST_BODY_SIZE}.`;
       if (req.path === '/v1/messages') {
         return sendAnthropicError(res, 413, message, 'invalid_request_error');
       }
@@ -655,6 +678,35 @@ function formatOpenAIStreamError(err) {
 }
 
 /**
+ * Writes a chunk to a response, waiting for the socket to drain first when the
+ * client is slower than the upstream stream.
+ *
+ * Ignoring res.write()'s return value lets an unbounded amount of SSE data pile
+ * up in the gateway's memory for a slow consumer, which ends in an OOM kill on
+ * long responses. Awaiting 'drain' keeps only the kernel buffer in flight.
+ *
+ * @param {object} res - Express response
+ * @param {string} chunk - Chunk to write
+ * @returns {Promise<void>}
+ */
+async function writeWithBackpressure(res, chunk) {
+  if (res.write(chunk)) return;
+
+  await new Promise((resolve) => {
+    const done = () => {
+      res.off('drain', done);
+      res.off('close', done);
+      res.off('error', done);
+      resolve();
+    };
+    res.on('drain', done);
+    // A client that disconnects while the buffer is full never emits 'drain'.
+    res.on('close', done);
+    res.on('error', done);
+  });
+}
+
+/**
  * Streams an OpenAI-formatted response to the client.
  *
  * @param {object} res - Express response
@@ -682,7 +734,7 @@ async function streamOpenAIResponse(res, ac, options) {
         clientDisconnected = true;
         break;
       }
-      res.write(chunk);
+      await writeWithBackpressure(res, chunk);
     }
   } catch (err) {
     if (ac.signal.aborted || err.name === 'AbortError') {
@@ -745,7 +797,7 @@ async function streamAnthropicResponse(res, ac, options) {
         clientDisconnected = true;
         break;
       }
-      res.write(chunk);
+      await writeWithBackpressure(res, chunk);
     }
   } catch (err) {
     if (ac.signal.aborted || err.name === 'AbortError') {
@@ -780,4 +832,4 @@ async function streamAnthropicResponse(res, ac, options) {
   }
 }
 
-module.exports = { createServer };
+module.exports = { createServer, writeWithBackpressure };

@@ -15,8 +15,15 @@ const {
   checkPortInUse,
   startInBackground,
   stopBackground,
+  getStatus,
+  removeFileWithRetry,
+  writeFileWithRetry,
+  probeHost,
+  formatUrlHost,
+  buildHealthUrl,
   cleanupPidFile,
   redirectOutputToLogFile,
+  flushLogOutput,
   waitForServerHealthy,
   readTail,
 } = require('../src/daemon');
@@ -313,16 +320,135 @@ test('stopBackground: stops a live process and removes the pid file', async () =
   assert.equal(fs.existsSync(pidFile), false);
 });
 
-test('stopBackground: escalates to SIGKILL when SIGTERM is ignored', async () => {
-  const { pidFile } = tempPaths('stop-ignore');
-  const child = spawnNode(IGNORE_TERM_SCRIPT);
-  await new Promise((resolve) => child.on('spawn', resolve));
-  fs.writeFileSync(pidFile, `${child.pid}\n`, 'utf8');
+test(
+  'stopBackground: escalates to SIGKILL when SIGTERM is ignored',
+  { skip: process.platform === 'win32' && 'Windows terminates unconditionally; there is nothing to escalate' },
+  async () => {
+    const { pidFile } = tempPaths('stop-ignore');
+    const child = spawnNode(IGNORE_TERM_SCRIPT);
+    await new Promise((resolve) => child.on('spawn', resolve));
+    fs.writeFileSync(pidFile, `${child.pid}\n`, 'utf8');
 
-  const stoppedPid = await stopBackground({ pidFile, waitTimeoutMs: 300, killGraceMs: 500 });
-  assert.equal(stoppedPid, child.pid);
-  assert.equal(isProcessAlive(child.pid), false);
+    const stoppedPid = await stopBackground({ pidFile, waitTimeoutMs: 300, killGraceMs: 500 });
+    assert.equal(stoppedPid, child.pid);
+    assert.equal(isProcessAlive(child.pid), false);
+    assert.equal(fs.existsSync(pidFile), false);
+  }
+);
+
+test('stopBackground: win32 terminates once and never escalates', async () => {
+  const { pidFile } = tempPaths('stop-win32');
+  fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+
+  const signals = [];
+  await assert.rejects(
+    () =>
+      stopBackground({
+        pidFile,
+        platform: 'win32',
+        killImpl: (pid, signal) => signals.push(signal),
+        isAliveImpl: () => true,
+        waitTimeoutMs: 50,
+        killGraceMs: 50,
+      }),
+    /did not exit after being terminated/
+  );
+  assert.deepEqual(signals, ['SIGTERM']);
+  assert.equal(fs.existsSync(pidFile), true);
+});
+
+test('stopBackground: posix escalates SIGTERM to SIGKILL', async () => {
+  const { pidFile } = tempPaths('stop-posix');
+  fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+
+  const signals = [];
+  await assert.rejects(
+    () =>
+      stopBackground({
+        pidFile,
+        platform: 'darwin',
+        killImpl: (pid, signal) => signals.push(signal),
+        isAliveImpl: () => true,
+        waitTimeoutMs: 50,
+        killGraceMs: 50,
+      }),
+    /did not exit after SIGTERM and SIGKILL/
+  );
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('stopBackground: reports permission denied with a platform hint', async () => {
+  const { pidFile } = tempPaths('stop-eperm');
+  fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+
+  const denied = () => {
+    const err = new Error('access denied');
+    err.code = 'EPERM';
+    throw err;
+  };
+
+  await assert.rejects(
+    () => stopBackground({ pidFile, platform: 'win32', killImpl: denied, isAliveImpl: () => true }),
+    /elevated prompt/
+  );
+  await assert.rejects(
+    () => stopBackground({ pidFile, platform: 'linux', killImpl: denied, isAliveImpl: () => true }),
+    /sudo/
+  );
+});
+
+test('stopBackground: treats ESRCH from kill as already stopped', async () => {
+  const { pidFile } = tempPaths('stop-esrch');
+  fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+
+  const gone = () => {
+    const err = new Error('no such process');
+    err.code = 'ESRCH';
+    throw err;
+  };
+
+  const stoppedPid = await stopBackground({
+    pidFile,
+    killImpl: gone,
+    isAliveImpl: () => true,
+  });
+  assert.equal(stoppedPid, process.pid);
   assert.equal(fs.existsSync(pidFile), false);
+});
+
+// ==================================================================================================
+// removeFileWithRetry / writeFileWithRetry
+// ==================================================================================================
+
+test('removeFileWithRetry: removes an existing file', () => {
+  const file = path.join(tmpDir, 'retry-remove.txt');
+  fs.writeFileSync(file, 'x', 'utf8');
+
+  assert.equal(removeFileWithRetry(file), true);
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('removeFileWithRetry: reports success for a missing file', () => {
+  assert.equal(removeFileWithRetry(path.join(tmpDir, 'retry-missing.txt')), true);
+});
+
+test('removeFileWithRetry: reports failure for a non-empty directory', () => {
+  const dir = path.join(tmpDir, 'retry-dir');
+  fs.mkdirSync(path.join(dir, 'child'), { recursive: true });
+
+  assert.equal(removeFileWithRetry(dir, { attempts: 2, delayMs: 1 }), false);
+  assert.equal(fs.existsSync(dir), true);
+});
+
+test('writeFileWithRetry: writes the file content', () => {
+  const file = path.join(tmpDir, 'retry-write.txt');
+  assert.equal(writeFileWithRetry(file, 'pid\n'), true);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'pid\n');
+});
+
+test('writeFileWithRetry: reports failure when the directory is missing', () => {
+  const file = path.join(tmpDir, 'no-such-dir', 'file.txt');
+  assert.equal(writeFileWithRetry(file, 'x', { attempts: 2, delayMs: 1 }), false);
 });
 
 // ==================================================================================================
@@ -498,4 +624,136 @@ test('readTail: returns fewer lines when the file is short', () => {
 
 test('readTail: returns empty for a missing file', () => {
   assert.equal(readTail(path.join(tmpDir, 'no-tail.log')), '');
+});
+
+// ==================================================================================================
+// getStatus
+// ==================================================================================================
+
+test('getStatus: reports not running when the pid file is missing', async () => {
+  const { pidFile, logFile } = tempPaths('status-missing');
+  const status = await getStatus({ pidFile, logFile });
+
+  assert.equal(status.running, false);
+  assert.equal(status.pid, null);
+  assert.equal(status.stale, false);
+  assert.equal(status.corrupted, false);
+  assert.equal(status.pidFile, pidFile);
+  assert.equal(status.logFile, logFile);
+});
+
+test('getStatus: reports a corrupted pid file', async () => {
+  const { pidFile, logFile } = tempPaths('status-corrupt');
+  fs.writeFileSync(pidFile, 'junk\n', 'utf8');
+
+  const status = await getStatus({ pidFile, logFile });
+  assert.equal(status.running, false);
+  assert.equal(status.corrupted, true);
+  assert.equal(status.raw, 'junk');
+});
+
+test('getStatus: reports a stale pid file', async () => {
+  const { pidFile, logFile } = tempPaths('status-stale');
+  fs.writeFileSync(pidFile, '99999999\n', 'utf8');
+
+  const status = await getStatus({ pidFile, logFile });
+  assert.equal(status.running, false);
+  assert.equal(status.pid, 99999999);
+  assert.equal(status.stale, true);
+});
+
+test('getStatus: reports a running server and probes /health', async (t) => {
+  const { server, port } = await startHealthServer();
+  t.after(() => closeServer(server));
+
+  const { pidFile, logFile } = tempPaths('status-live');
+  fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+
+  const status = await getStatus({ pidFile, logFile, host: '0.0.0.0', port });
+  assert.equal(status.running, true);
+  assert.equal(status.pid, process.pid);
+  assert.equal(status.stale, false);
+  assert.equal(status.healthy, true);
+  assert.equal(status.url, `http://127.0.0.1:${port}/health`);
+});
+
+test('getStatus: reports unhealthy when the port does not answer', async () => {
+  const { pidFile, logFile } = tempPaths('status-unhealthy');
+  fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+
+  const status = await getStatus({ pidFile, logFile, port: 1, requestTimeoutMs: 500 });
+  assert.equal(status.running, true);
+  assert.equal(status.healthy, false);
+});
+
+test('getStatus: skips the health probe without a port', async () => {
+  const { pidFile, logFile } = tempPaths('status-noport');
+  fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+
+  const status = await getStatus({ pidFile, logFile });
+  assert.equal(status.running, true);
+  assert.equal(status.healthy, null);
+  assert.equal(status.url, null);
+});
+
+// ==================================================================================================
+// probeHost / formatUrlHost / buildHealthUrl (IPv4 + IPv6)
+// ==================================================================================================
+
+test('probeHost: maps wildcard and localhost to loopback', () => {
+  assert.equal(probeHost(undefined), '127.0.0.1');
+  assert.equal(probeHost(''), '127.0.0.1');
+  assert.equal(probeHost('0.0.0.0'), '127.0.0.1');
+  assert.equal(probeHost('localhost'), '127.0.0.1');
+  assert.equal(probeHost('127.0.0.1'), '127.0.0.1');
+  assert.equal(probeHost('192.168.1.10'), '192.168.1.10');
+});
+
+test('probeHost: maps IPv6 wildcards to ::1', () => {
+  assert.equal(probeHost('::'), '::1');
+  assert.equal(probeHost('::0'), '::1');
+  assert.equal(probeHost('0:0:0:0:0:0:0:0'), '::1');
+  assert.equal(probeHost('::1'), '::1');
+});
+
+test('formatUrlHost: brackets IPv6 literals only', () => {
+  assert.equal(formatUrlHost('127.0.0.1'), '127.0.0.1');
+  assert.equal(formatUrlHost('example.com'), 'example.com');
+  assert.equal(formatUrlHost('::1'), '[::1]');
+  assert.equal(formatUrlHost('[::1]'), '[::1]');
+});
+
+test('buildHealthUrl: produces a valid URL for IPv4 and IPv6 hosts', () => {
+  assert.equal(buildHealthUrl('0.0.0.0', 8000), 'http://127.0.0.1:8000/health');
+  assert.equal(buildHealthUrl('::', 8000), 'http://[::1]:8000/health');
+  assert.equal(buildHealthUrl('', 9000), 'http://127.0.0.1:9000/health');
+  // Must parse as a real URL (an unbracketed IPv6 host would throw here).
+  assert.equal(new URL(buildHealthUrl('::1', 8123)).port, '8123');
+});
+
+// ==================================================================================================
+// flushLogOutput
+// ==================================================================================================
+
+test('flushLogOutput: is a no-op when no log redirection is active', async () => {
+  // Must not hang or throw when the process runs in the foreground.
+  await flushLogOutput(50);
+});
+
+test('flushLogOutput: flushes buffered lines before the process exits', async () => {
+  const logFile = path.join(tmpDir, 'flush.log');
+  const daemonModulePath = require.resolve('../src/daemon');
+  const script =
+    `const { redirectOutputToLogFile, flushLogOutput } = require(${JSON.stringify(daemonModulePath)});\n` +
+    `redirectOutputToLogFile(${JSON.stringify(logFile)});\n` +
+    `console.log('line one');\n` +
+    `console.log('line two');\n` +
+    `flushLogOutput().then(() => process.exit(0));\n`;
+
+  const child = spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+  await waitForExit(child);
+
+  const content = fs.readFileSync(logFile, 'utf8');
+  assert.ok(content.includes('line one'), 'first line should be flushed');
+  assert.ok(content.includes('line two'), 'last line should be flushed');
 });

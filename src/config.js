@@ -238,6 +238,10 @@ const FIRST_TOKEN_MAX_RETRIES = envInt('FIRST_TOKEN_MAX_RETRIES', 3);
 // disable.
 const STREAM_KEEPALIVE_INTERVAL = envFloat('STREAM_KEEPALIVE_INTERVAL', 15);
 
+// Maximum accepted request body size. Chat payloads with images or long
+// histories get large, but an unbounded limit lets one client exhaust memory.
+const MAX_REQUEST_BODY_SIZE = envStr('MAX_REQUEST_BODY_SIZE', '25mb');
+
 // ==================================================================================================
 // Account System Settings
 // ==================================================================================================
@@ -334,6 +338,7 @@ module.exports = {
   STREAMING_READ_TIMEOUT,
   FIRST_TOKEN_MAX_RETRIES,
   STREAM_KEEPALIVE_INTERVAL,
+  MAX_REQUEST_BODY_SIZE,
   ACCOUNT_SYSTEM,
   ACCOUNTS_CONFIG_FILE,
   ACCOUNT_RECOVERY_TIMEOUT,

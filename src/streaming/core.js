@@ -346,6 +346,7 @@ async function collectStreamToResult(response, options = {}) {
     usage: null,
     contextUsagePercentage: null,
     refusal: null,
+    stopReason: null,
   };
   let fullContentForBracketTools = '';
 
@@ -434,11 +435,15 @@ async function* streamWithFirstTokenRetry({
   // mid-stream failure can no longer be retried transparently.
   let yielded = false;
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  // A configured 0 would skip the loop entirely and report the misleading
+  // "no successful attempt and no error recorded" for a plain failure.
+  const attempts = Math.max(1, maxRetries);
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
     let response = null;
     try {
       if (attempt > 0) {
-        logger.warning(`Retry attempt ${attempt + 1}/${maxRetries} after first token timeout`);
+        logger.warning(`Retry attempt ${attempt + 1}/${attempts} after first token timeout`);
       }
 
       // On the first attempt, reuse the initial response if provided
@@ -505,7 +510,7 @@ async function* streamWithFirstTokenRetry({
       if (err instanceof FirstTokenTimeoutError) {
         lastError = err;
         logger.warning(
-          `[FirstTokenTimeout] Attempt ${attempt + 1}/${maxRetries} failed - ` +
+          `[FirstTokenTimeout] Attempt ${attempt + 1}/${attempts} failed - ` +
             `model did not respond within ${firstTokenTimeout}s`
         );
 
@@ -516,7 +521,7 @@ async function* streamWithFirstTokenRetry({
       if (err instanceof EmptyUpstreamStreamError) {
         lastError = err;
         logger.warning(
-          `[EmptyStream] Attempt ${attempt + 1}/${maxRetries} failed - ` +
+          `[EmptyStream] Attempt ${attempt + 1}/${attempts} failed - ` +
             'upstream closed the response without sending any data'
         );
 
@@ -539,7 +544,7 @@ async function* streamWithFirstTokenRetry({
           lastError = err;
           logger.warning(
             `${errorInfo.userMessage} before any data was sent - ` +
-              `retrying (attempt ${attempt + 1}/${maxRetries})`
+              `retrying (attempt ${attempt + 1}/${attempts})`
           );
           await cancelCurrentResponse();
           continue;
@@ -557,12 +562,12 @@ async function* streamWithFirstTokenRetry({
   // often not a first token timeout at all (connection resets and empty upstream
   // streams land here too), so it is what the client gets told about.
   const lastReason = describeAttemptFailure(lastError, firstTokenTimeout);
-  logger.error(`[StreamFailed] All ${maxRetries} attempts exhausted - ${lastReason}`);
+  logger.error(`[StreamFailed] All ${attempts} attempts exhausted - ${lastReason}`);
 
   if (onAllRetriesFailed) {
-    throw onAllRetriesFailed(maxRetries, firstTokenTimeout, lastError);
+    throw onAllRetriesFailed(attempts, firstTokenTimeout, lastError);
   }
-  throw new Error(`Upstream request failed after ${maxRetries} attempts: ${lastReason}`);
+  throw new Error(`Upstream request failed after ${attempts} attempts: ${lastReason}`);
 }
 
 /**

@@ -285,6 +285,39 @@ class KiroHttpClient {
   }
 
   /**
+   * Drains a response body that is about to be retried away.
+   *
+   * An unconsumed undici body pins its socket (and file descriptor) for as
+   * long as the response object is alive, so a sustained run of 429/5xx
+   * replies leaks one connection per retry. Draining here frees the socket
+   * immediately while keeping the body readable, because the caller still
+   * needs the error text of the final response. The drained text is returned
+   * as a replayable stream.
+   *
+   * @param {object} response - undici Response about to be discarded
+   * @returns {Promise<object>} The same response with a replayable body
+   */
+  async _releaseForRetry(response) {
+    const { Readable } = require('node:stream');
+
+    let text = '';
+    try {
+      for await (const chunk of response.body) {
+        // Keep the payload bounded: error bodies are small, and a caller that
+        // wants more than this is not reading an error message.
+        if (text.length < 1024 * 1024) {
+          text += Buffer.from(chunk).toString('utf8');
+        }
+      }
+    } catch {
+      // A body that fails mid-read is still better released than pinned.
+    }
+
+    response.body = Readable.from([Buffer.from(text, 'utf8')]);
+    return response;
+  }
+
+  /**
    * Executes a request with retry logic.
    *
    * @param {string} method - HTTP method (GET, POST, etc.)
@@ -349,7 +382,7 @@ class KiroHttpClient {
 
         // 429 - rate limit, wait and retry
         if (response.statusCode === 429) {
-          lastResponse = response;
+          lastResponse = await this._releaseForRetry(response);
           const delay = backoffDelaySeconds(attempt);
           logger.warning(`Received 429, waiting ${delay.toFixed(2)}s (attempt ${attempt + 1}/${maxRetries})`);
           await this._sleep(delay);
@@ -358,7 +391,7 @@ class KiroHttpClient {
 
         // 5xx - server error, wait and retry
         if (response.statusCode >= 500 && response.statusCode < 600) {
-          lastResponse = response;
+          lastResponse = await this._releaseForRetry(response);
           const delay = backoffDelaySeconds(attempt);
           logger.warning(
             `Received ${response.statusCode}, waiting ${delay.toFixed(2)}s (attempt ${attempt + 1}/${maxRetries})`

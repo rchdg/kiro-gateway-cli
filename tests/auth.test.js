@@ -463,3 +463,98 @@ test('KiroHttpClient: network errors raise ApiError after retries', async () => 
     }
   );
 });
+// ==================================================================================================
+// KiroHttpClient: retryable responses must release their body
+// ==================================================================================================
+
+test('KiroHttpClient: 429 bodies are drained before the retry delay', async () => {
+  // An unconsumed undici body pins its socket for the whole backoff delay,
+  // which leaks one connection per retry under sustained rate limiting.
+  const drained = [];
+  let callCount = 0;
+
+  undici.request = async () => {
+    callCount += 1;
+    const text = `{"message":"slow down ${callCount}"}`;
+    const body = {
+      [Symbol.asyncIterator]: async function* () {
+        drained.push(callCount);
+        yield Buffer.from(text, 'utf8');
+      },
+    };
+    body.json = async () => JSON.parse(text);
+    return { statusCode: 429, body };
+  };
+
+  const auth = new KiroAuthManager({ refreshToken: 'rt', region: 'us-east-1' });
+  auth._accessToken = 'token';
+  auth._expiresAt = Date.now() / 1000 + 7200;
+
+  const client = new KiroHttpClient(auth, { sleep: async () => {} });
+  const response = await client.requestWithRetry('POST', 'https://example.com', {});
+
+  assert.equal(response.statusCode, 429);
+  // Every attempt was drained, not just the last one.
+  assert.deepEqual(drained, [1, 2, 3]);
+});
+
+test('KiroHttpClient: a drained retry response keeps its error text readable', async () => {
+  undici.request = async () => ({
+    statusCode: 503,
+    body: makeJsonBody('{"message":"upstream overloaded","reason":"THROTTLED"}'),
+  });
+
+  const auth = new KiroAuthManager({ refreshToken: 'rt', region: 'us-east-1' });
+  auth._accessToken = 'token';
+  auth._expiresAt = Date.now() / 1000 + 7200;
+
+  const client = new KiroHttpClient(auth, { sleep: async () => {} });
+  const response = await client.requestWithRetry('POST', 'https://example.com', {});
+
+  assert.equal(response.statusCode, 503);
+  let text = '';
+  for await (const chunk of response.body) {
+    text += Buffer.from(chunk).toString('utf8');
+  }
+  assert.equal(text, '{"message":"upstream overloaded","reason":"THROTTLED"}');
+});
+
+// ==================================================================================================
+// forceRefresh: concurrent 403s share one refresh
+// ==================================================================================================
+
+test('forceRefresh: concurrent callers share a single refresh request', async () => {
+  const auth = new KiroAuthManager({ refreshToken: 'rt', region: 'us-east-1' });
+  auth._accessToken = 'stale';
+
+  let refreshCount = 0;
+  auth._refreshTokenRequest = async () => {
+    refreshCount += 1;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    auth._accessToken = `fresh-${refreshCount}`;
+  };
+
+  const tokens = await Promise.all([
+    auth.forceRefresh(),
+    auth.forceRefresh(),
+    auth.forceRefresh(),
+  ]);
+
+  assert.equal(refreshCount, 1);
+  assert.deepEqual(tokens, ['fresh-1', 'fresh-1', 'fresh-1']);
+});
+
+test('forceRefresh: a later call refreshes again after the in-flight one settles', async () => {
+  const auth = new KiroAuthManager({ refreshToken: 'rt', region: 'us-east-1' });
+  auth._accessToken = 'stale';
+
+  let refreshCount = 0;
+  auth._refreshTokenRequest = async () => {
+    refreshCount += 1;
+    auth._accessToken = `fresh-${refreshCount}`;
+  };
+
+  assert.equal(await auth.forceRefresh(), 'fresh-1');
+  assert.equal(await auth.forceRefresh(), 'fresh-2');
+  assert.equal(refreshCount, 2);
+});

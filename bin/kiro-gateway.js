@@ -10,7 +10,10 @@
  *   node bin/kiro-gateway.js serve --port 9000    # Override port only
  *   node bin/kiro-gateway.js -k my-key -t TOKEN   # Override common config
  *   node bin/kiro-gateway.js serve --background   # Run in the background (daemon)
+ *   node bin/kiro-gateway.js start                # Same as serve --background
+ *   node bin/kiro-gateway.js status               # Show the background server status
  *   node bin/kiro-gateway.js stop                 # Stop the background server
+ *   node bin/kiro-gateway.js update               # Upgrade to the latest npm version
  *
  * Configuration priority (highest to lowest):
  *   1. CLI arguments (--api-key, --port, ...)
@@ -93,6 +96,37 @@ function validateConfiguration(config) {
 // ==================================================================================================
 
 /**
+ * Writes credentials.json atomically with owner-only permissions.
+ *
+ * The file holds refresh tokens, so it must not be world-readable, and a
+ * truncating write would destroy every token if the process dies mid-write.
+ *
+ * @param {string} filePath - Target path
+ * @param {any} data - JSON-serializable credentials
+ */
+function writeCredentialsFile(filePath, data) {
+  const fs = require('node:fs');
+
+  const tempFile = `${filePath}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), { mode: 0o600 });
+    fs.renameSync(tempFile, filePath);
+    try {
+      fs.chmodSync(filePath, 0o600);
+    } catch {
+      // Windows has no POSIX modes
+    }
+  } catch (err) {
+    try {
+      fs.unlinkSync(tempFile);
+    } catch {
+      // best-effort cleanup
+    }
+    throw err;
+  }
+}
+
+/**
  * Creates credentials.json from legacy .env variables (one-time migration).
  *
  * @param {object} config - Config module
@@ -133,7 +167,7 @@ function migrateLegacyCredentials(config) {
 
   credentials.push(entry);
 
-  fs.writeFileSync(config.ACCOUNTS_CONFIG_FILE, JSON.stringify(credentials, null, 2), 'utf8');
+  writeCredentialsFile(config.ACCOUNTS_CONFIG_FILE, credentials);
   logger.info(`Created ${config.ACCOUNTS_CONFIG_FILE} from legacy credentials (one-time migration)`);
   return true;
 }
@@ -157,7 +191,7 @@ function autoDiscoverCredentials(config) {
     return false;
   }
 
-  fs.writeFileSync(config.ACCOUNTS_CONFIG_FILE, JSON.stringify(entries, null, 2), 'utf8');
+  writeCredentialsFile(config.ACCOUNTS_CONFIG_FILE, entries);
   logger.info(`Created ${config.ACCOUNTS_CONFIG_FILE} from auto-discovered credentials`);
   return true;
 }
@@ -190,8 +224,9 @@ function ensureCredentialsFile(config) {
  * @param {number} port - Server port
  */
 function printStartupBanner(host, port) {
+  const { formatUrlHost } = require('../src/daemon');
   const displayHost = host === '0.0.0.0' ? 'localhost' : host;
-  const url = `http://${displayHost}:${port}`;
+  const url = `http://${formatUrlHost(displayHost)}:${port}`;
 
   console.log();
   console.log(`  ${APP_TITLE} v${APP_VERSION}`);
@@ -243,6 +278,11 @@ async function main() {
     process.exit(0);
   }
 
+  // `start` is shorthand for `serve --background`
+  if (command === 'start') {
+    args.background = true;
+  }
+
   // ==============================================================================
   // Stop the background server (if any)
   // ==============================================================================
@@ -261,6 +301,27 @@ async function main() {
     process.exit(0);
   }
 
+  // ==============================================================================
+  // Upgrade to the latest published version (npm install -g)
+  // ==============================================================================
+  if (command === 'update') {
+    const { runUpdate, UpdateError } = require('../src/updater');
+    const { getStatus } = require('../src/daemon');
+    try {
+      await runUpdate({
+        currentVersion: APP_VERSION,
+        statusProvider: () => getStatus(),
+      });
+    } catch (err) {
+      if (err instanceof UpdateError) {
+        process.stderr.write(`Error: ${err.message}\n`);
+        process.exit(1);
+      }
+      throw err;
+    }
+    process.exit(0);
+  }
+
   // Apply CLI overrides to process.env BEFORE loading config-dependent modules.
   // This makes CLI flags the highest-priority configuration source.
   for (const [key, value] of Object.entries(args.overrides)) {
@@ -268,12 +329,72 @@ async function main() {
   }
 
   // ==============================================================================
+  // Report the background server status
+  // ==============================================================================
+  if (command === 'status') {
+    const { getStatus } = require('../src/daemon');
+    const config = require('../src/config');
+    const status = await getStatus({
+      host: config.SERVER_HOST,
+      port: config.SERVER_PORT,
+    });
+
+    if (status.running) {
+      process.stdout.write(`Kiro Gateway is running in the background (pid ${status.pid}).\n`);
+      if (status.healthy === true) {
+        process.stdout.write(`  Health:   ${status.url} (healthy)\n`);
+      } else if (status.healthy === false) {
+        process.stdout.write(`  Health:   ${status.url} (not responding)\n`);
+      }
+      process.stdout.write(`  PID file: ${status.pidFile}\n`);
+      process.stdout.write(`  Log file: ${status.logFile}\n`);
+      process.stdout.write('  Stop it with: kiro-gateway stop\n');
+      process.exit(0);
+    }
+
+    if (status.corrupted) {
+      process.stderr.write(
+        `Error: Corrupted pid file ${status.pidFile} (contains '${status.raw}'). ` +
+          "Run 'kiro-gateway start' to overwrite it, or remove it manually.\n"
+      );
+      process.exit(1);
+    }
+
+    if (status.stale) {
+      process.stdout.write(
+        `Kiro Gateway is not running (pid ${status.pid} from ${status.pidFile} is not alive).\n`
+      );
+      process.stdout.write(
+        "Run 'kiro-gateway stop' to clean up the stale pid file, or 'kiro-gateway start' to start a new server.\n"
+      );
+      process.exit(1);
+    }
+
+    process.stdout.write(
+      `Kiro Gateway is not running in the background (no pid file: ${status.pidFile}).\n`
+    );
+    process.stdout.write('Start it with: kiro-gateway start\n');
+    process.exit(1);
+  }
+
+  // ==============================================================================
   // Background (daemon) mode: spawn a detached child and return
   // ==============================================================================
   if (args.background) {
-    const { startInBackground, waitForServerHealthy, readTail, checkPortInUse, DaemonError } =
+    const { startInBackground, waitForServerHealthy, readTail, checkPortInUse, getStatus, DaemonError } =
       require('../src/daemon');
     const config = require('../src/config');
+
+    // Fail early when a background server is already tracked by the pid file,
+    // so the message points at `stop` instead of a port conflict.
+    const current = await getStatus();
+    if (current.running) {
+      process.stderr.write(
+        `Error: Server is already running in the background (pid ${current.pid}). ` +
+          "Run 'kiro-gateway stop' to stop it.\n"
+      );
+      process.exit(1);
+    }
 
     // Pre-flight check: if the port is already occupied (another gateway or
     // any other service), the child would fail to bind after the account
@@ -286,9 +407,12 @@ async function main() {
       process.exit(1);
     }
 
-    // Re-invoke this script without the --background flag so the child runs
-    // the normal foreground flow (instead of spawning another daemon).
-    const childArgs = process.argv.slice(2).filter((a) => a !== '--background' && a !== '-b');
+    // Re-invoke this script without the --background flag or the `start`
+    // subcommand so the child runs the normal foreground flow (instead of
+    // spawning another daemon).
+    const rawArgs = process.argv.slice(2);
+    const daemonArgs = command === 'start' ? rawArgs.slice(1) : rawArgs;
+    const childArgs = daemonArgs.filter((a) => a !== '--background' && a !== '-b');
 
     let daemon;
     try {
@@ -307,6 +431,7 @@ async function main() {
 
     if (result.ok) {
       process.stdout.write(`Server is running in the background: ${result.url}\n`);
+      process.stdout.write('Check it with: kiro-gateway status\n');
       process.stdout.write('Stop it with: kiro-gateway stop\n');
     } else if (result.childExited) {
       process.stderr.write(`Background server exited during startup (exit code ${result.exitCode}).\n`);
@@ -314,11 +439,15 @@ async function main() {
       if (tail) {
         process.stderr.write(`Last log lines from ${daemon.logFile}:\n${tail}\n`);
       }
+      // The child is gone, so its pid record is stale: drop it now instead
+      // of leaving `status` reporting a dead server until the next start.
+      require('../src/daemon').removeFileWithRetry(daemon.pidFile);
       process.exit(1);
     } else {
       process.stdout.write(
         `Server is starting in the background (pid ${daemon.pid}).\n` +
         `Check progress in the log file: ${daemon.logFile}\n` +
+        'Check it with: kiro-gateway status\n' +
         'Stop it with: kiro-gateway stop\n'
       );
     }
@@ -393,33 +522,124 @@ async function main() {
   logger.info(`Starting server on ${finalHost}:${finalPort}...`);
 
   const server = app.listen(finalPort, finalHost, () => {
-    logger.info(`Server is running at http://${finalHost}:${finalPort}`);
+    const { formatUrlHost } = require('../src/daemon');
+    logger.info(`Server is running at http://${formatUrlHost(finalHost)}:${finalPort}`);
+  });
+
+  // Bind failures arrive as an 'error' event, not as a thrown exception, so
+  // without this handler Node prints a raw stack trace (syscall/errno/address)
+  // for something the user can fix by changing one flag.
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      logger.error(
+        `Port ${finalPort} is already in use on ${finalHost}. ` +
+          'Stop the process using it or choose another port with --port.'
+      );
+    } else if (err.code === 'EACCES') {
+      logger.error(
+        `Permission denied binding ${finalHost}:${finalPort}. ` +
+          'Ports below 1024 need elevated privileges; choose a port above 1024.'
+      );
+    } else if (err.code === 'EADDRNOTAVAIL') {
+      logger.error(
+        `Cannot bind ${finalHost}:${finalPort}: the address does not belong to this machine. ` +
+          'Check the --host value.'
+      );
+    } else {
+      logger.error(`Failed to start the server on ${finalHost}:${finalPort}: ${err.message}`);
+    }
+
+    if (process.env.KIRO_DAEMON_CHILD === '1') {
+      require('../src/daemon').cleanupPidFile();
+    }
+    process.exit(1);
   });
 
   // Graceful shutdown
-  const shutdown = () => {
-    logger.info('Shutting down application...');
+  let shuttingDown = false;
+
+  /**
+   * Exits the process after flushing the redirected log stream.
+   *
+   * process.exit() drops buffered writes to a file stream, which loses the
+   * final log lines - precisely the ones that explain a shutdown or a crash.
+   *
+   * @param {number} code - Exit code
+   */
+  const exitAfterFlush = async (code) => {
+    try {
+      await require('../src/daemon').flushLogOutput();
+    } catch {
+      // Never let logging block the exit
+    }
+    process.exit(code);
+  };
+
+  /**
+   * Cleans up daemon state before the process goes away.
+   */
+  const cleanupIfDaemon = () => {
+    if (process.env.KIRO_DAEMON_CHILD !== '1') return;
+    try {
+      require('../src/daemon').cleanupPidFile();
+    } catch {
+      // best-effort cleanup
+    }
+  };
+
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    logger.info(`Shutting down application (${signal || 'shutdown'})...`);
+
     server.close(() => {
-      if (process.env.KIRO_DAEMON_CHILD === '1') {
-        require('../src/daemon').cleanupPidFile();
-      }
+      cleanupIfDaemon();
       logger.info('Server closed');
-      process.exit(0);
+      exitAfterFlush(0);
     });
+
+    // Keep-alive clients hold the listener open long after the last response,
+    // so idle sockets are dropped immediately; only in-flight requests get the
+    // grace period below.
+    if (typeof server.closeIdleConnections === 'function') {
+      server.closeIdleConnections();
+    }
+
     // Force exit if connections don't close within 5 seconds
     setTimeout(() => {
-      if (process.env.KIRO_DAEMON_CHILD === '1') {
-        require('../src/daemon').cleanupPidFile();
-      }
-      process.exit(0);
+      cleanupIfDaemon();
+      logger.warning('Forcing shutdown after timeout');
+      exitAfterFlush(0);
     }, 5000).unref();
   };
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // A single unhandled rejection used to take the gateway down silently in
+  // background mode: the daemon just vanished and `status` reported it stopped
+  // with no explanation. Log it with a stack so the log file explains why.
+  process.on('unhandledRejection', (reason) => {
+    const detail = reason instanceof Error ? reason.stack || reason.message : String(reason);
+    logger.error(`Unhandled promise rejection: ${detail}`);
+  });
+
+  // An uncaught exception leaves the process in an unknown state, so it is
+  // still fatal - but it must be reported and the pid file cleaned up.
+  process.on('uncaughtException', (err) => {
+    logger.error(`Uncaught exception: ${err.stack || err.message}`);
+    cleanupIfDaemon();
+    exitAfterFlush(1);
+  });
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   process.stderr.write(`Fatal error: ${err.message}\n`);
+  try {
+    await require('./../src/daemon').flushLogOutput();
+  } catch {
+    // Never let logging block the exit
+  }
   process.exit(1);
 });

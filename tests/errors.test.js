@@ -66,12 +66,17 @@ test('classifyError: recoverable errors', () => {
   assert.equal(classifyError(400, 'INVALID_MODEL_ID'), ErrorType.RECOVERABLE);
 });
 
+test('classifyError: upstream 5xx is recoverable (failover to another account)', () => {
+  assert.equal(classifyError(500, null), ErrorType.RECOVERABLE);
+  assert.equal(classifyError(503, null), ErrorType.RECOVERABLE);
+  assert.equal(classifyError(529, null), ErrorType.RECOVERABLE);
+});
+
 test('classifyError: fatal errors', () => {
   assert.equal(classifyError(400, null), ErrorType.FATAL);
   assert.equal(classifyError(400, 'CONTENT_LENGTH_EXCEEDS_THRESHOLD'), ErrorType.FATAL);
+  assert.equal(classifyError(404, null), ErrorType.FATAL);
   assert.equal(classifyError(422, null), ErrorType.FATAL);
-  assert.equal(classifyError(500, null), ErrorType.FATAL);
-  assert.equal(classifyError(503, null), ErrorType.FATAL);
 });
 
 // ==================================================================================================

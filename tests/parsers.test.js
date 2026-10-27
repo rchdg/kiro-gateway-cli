@@ -230,6 +230,48 @@ test('AwsEventStreamParser: a plain END_TURN stop is not a refusal', () => {
   assert.equal(events.filter((e) => e.type === 'refusal').length, 0);
 });
 
+test('AwsEventStreamParser: a TOOL_USE stop is reported as a stop reason, not a refusal', () => {
+  const parser = new AwsEventStreamParser();
+  const chunks = buildEventStreamChunks([{ stopReason: 'TOOL_USE' }]);
+
+  const events = [];
+  for (const chunk of chunks) {
+    events.push(...parser.feed(chunk));
+  }
+
+  assert.equal(events.filter((e) => e.type === 'refusal').length, 0);
+  const stops = events.filter((e) => e.type === 'stop_reason');
+  assert.equal(stops.length, 1);
+  assert.equal(stops[0].data, 'TOOL_USE');
+});
+
+test('AwsEventStreamParser: a MAX_TOKENS stop is reported as a stop reason, not a refusal', () => {
+  const parser = new AwsEventStreamParser();
+  const chunks = buildEventStreamChunks([{ stopReason: 'MAX_TOKENS' }]);
+
+  const events = [];
+  for (const chunk of chunks) {
+    events.push(...parser.feed(chunk));
+  }
+
+  assert.equal(events.filter((e) => e.type === 'refusal').length, 0);
+  assert.equal(events.filter((e) => e.type === 'stop_reason')[0].data, 'MAX_TOKENS');
+});
+
+test('AwsEventStreamParser: an unknown stop reason is still a refusal', () => {
+  const parser = new AwsEventStreamParser();
+  const chunks = buildEventStreamChunks([{ stopReason: 'CONTENT_FILTERED' }]);
+
+  const events = [];
+  for (const chunk of chunks) {
+    events.push(...parser.feed(chunk));
+  }
+
+  const refusals = events.filter((e) => e.type === 'refusal');
+  assert.equal(refusals.length, 1);
+  assert.equal(refusals[0].data.stopReason, 'CONTENT_FILTERED');
+});
+
 test('AwsEventStreamParser: tool calls assembled from start/input/stop events', () => {
   const parser = new AwsEventStreamParser();
 
