@@ -336,6 +336,89 @@ test('KiroAuthManager: AWS SSO OIDC refresh uses camelCase payload', async () =>
   });
 });
 
+test('KiroAuthManager: refresh error reports an expired device registration', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const clientIdHash = 'abc123';
+  const cacheDir = path.join(dir, '.aws', 'sso', 'cache');
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(cacheDir, `${clientIdHash}.json`),
+    JSON.stringify({
+      clientId: 'client-1',
+      clientSecret: 'secret-1',
+      expiresAt: '2026-01-01T00:00:00Z',
+    })
+  );
+
+  const credsFile = path.join(dir, 'credentials.json');
+  fs.writeFileSync(
+    credsFile,
+    JSON.stringify({ refreshToken: 'rt', clientIdHash, region: 'us-east-1' })
+  );
+
+  undici.request = async () => ({
+    statusCode: 400,
+    body: makeJsonBody('{"error":"invalid_grant","error_description":"Invalid refresh token provided"}'),
+  });
+
+  const origHomedir = os.homedir;
+  os.homedir = () => dir;
+  try {
+    const auth = new KiroAuthManager({ credsFile });
+    auth._expiresAt = Date.now() / 1000 - 10;
+
+    await assert.rejects(auth.getAccessToken(), (err) => {
+      assert.match(err.message, /invalid_grant/);
+      assert.match(err.message, /device registration expired at 2026-01-01T00:00:00\.000Z/);
+      assert.match(err.message, /kiro-cli login/);
+      return true;
+    });
+  } finally {
+    os.homedir = origHomedir;
+  }
+});
+
+test('KiroAuthManager: no expiry hint when the device registration is still valid', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-test-'));
+  const clientIdHash = 'def456';
+  const cacheDir = path.join(dir, '.aws', 'sso', 'cache');
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(cacheDir, `${clientIdHash}.json`),
+    JSON.stringify({
+      clientId: 'client-1',
+      clientSecret: 'secret-1',
+      expiresAt: '2999-01-01T00:00:00Z',
+    })
+  );
+
+  const credsFile = path.join(dir, 'credentials.json');
+  fs.writeFileSync(
+    credsFile,
+    JSON.stringify({ refreshToken: 'rt', clientIdHash, region: 'us-east-1' })
+  );
+
+  undici.request = async () => ({
+    statusCode: 400,
+    body: makeJsonBody('{"error":"invalid_grant"}'),
+  });
+
+  const origHomedir = os.homedir;
+  os.homedir = () => dir;
+  try {
+    const auth = new KiroAuthManager({ credsFile });
+    auth._expiresAt = Date.now() / 1000 - 10;
+
+    await assert.rejects(auth.getAccessToken(), (err) => {
+      assert.match(err.message, /invalid_grant/);
+      assert.doesNotMatch(err.message, /device registration expired/);
+      return true;
+    });
+  } finally {
+    os.homedir = origHomedir;
+  }
+});
+
 // ==================================================================================================
 // KiroHttpClient
 // ==================================================================================================

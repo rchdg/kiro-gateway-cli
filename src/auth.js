@@ -105,6 +105,10 @@ class KiroAuthManager {
     // Enterprise Kiro IDE specific fields
     this._clientIdHash = null;
 
+    // AWS SSO OIDC device registration expiry (epoch seconds). Refresh tokens
+    // stop working once the registration that issued them expires.
+    this._deviceRegistrationExpiresAt = null;
+
     // Auto-detected API region from credentials
     this._detectedApiRegion = null;
 
@@ -224,6 +228,9 @@ class KiroAuthManager {
             if (regData.region && !this._ssoRegion) {
               this._ssoRegion = regData.region;
             }
+            this._trackDeviceRegistrationExpiry(
+              regData.client_secret_expires_at || regData.expiresAt
+            );
           } catch {
             // Ignore malformed registration data
           }
@@ -341,9 +348,29 @@ class KiroAuthManager {
       const deviceData = JSON.parse(fs.readFileSync(deviceRegPath, 'utf8'));
       if (deviceData.clientId) this._clientId = deviceData.clientId;
       if (deviceData.clientSecret) this._clientSecret = deviceData.clientSecret;
+      this._trackDeviceRegistrationExpiry(deviceData.expiresAt);
       logger.info(`Enterprise device registration loaded from ${deviceRegPath}`);
     } catch (err) {
       logger.error(`Error loading enterprise device registration: ${err.message}`);
+    }
+  }
+
+  /**
+   * Records when the AWS SSO OIDC device registration expires and warns when
+   * it is already past, because its refresh token can no longer be renewed.
+   *
+   * @param {string|undefined} expiresStr - Registration expiry timestamp
+   */
+  _trackDeviceRegistrationExpiry(expiresStr) {
+    const parsed = parseExpiresAt(expiresStr);
+    if (parsed === null) return;
+
+    this._deviceRegistrationExpiresAt = parsed;
+    if (parsed * 1000 <= Date.now()) {
+      logger.warning(
+        `Device registration expired at ${new Date(parsed * 1000).toISOString()}. ` +
+          'Run `kiro-cli login` or sign in to Kiro IDE again to re-authenticate.'
+      );
     }
   }
 
@@ -632,7 +659,8 @@ class KiroAuthManager {
     if (response.statusCode !== 200) {
       const text = await readBodyText(response.body);
       const err = new Error(
-        `AWS SSO OIDC refresh failed: ${response.statusCode} ${text.slice(0, 300)}`
+        `AWS SSO OIDC refresh failed: ${response.statusCode} ${text.slice(0, 300)}` +
+          registrationExpiredHint(this._deviceRegistrationExpiresAt)
       );
       err.statusCode = response.statusCode;
       throw err;
@@ -798,6 +826,21 @@ function expandUserPath(p) {
     return path.join(os.homedir(), p.slice(1));
   }
   return p;
+}
+
+/**
+ * Builds an actionable hint for an expired AWS SSO OIDC device registration.
+ *
+ * @param {number|null} expiresAtSeconds - Registration expiry (epoch seconds)
+ * @returns {string} Empty string when the registration is still valid
+ */
+function registrationExpiredHint(expiresAtSeconds) {
+  if (!expiresAtSeconds || expiresAtSeconds * 1000 > Date.now()) return '';
+  return (
+    ` The device registration expired at ${new Date(expiresAtSeconds * 1000).toISOString()}, ` +
+    'so its refresh token is no longer valid. Run `kiro-cli login` or sign in to ' +
+    'Kiro IDE again to re-authenticate.'
+  );
 }
 
 /**

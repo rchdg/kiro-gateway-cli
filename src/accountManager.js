@@ -191,6 +191,62 @@ class AccountManager {
   }
 
   /**
+   * Adds credential entries discovered at runtime (e.g. a local Kiro IDE
+   * token file or a kiro-cli database) that were not listed in
+   * credentials.json yet.
+   *
+   * Used as a fallback when the configured credentials can no longer be
+   * refreshed, so the gateway keeps working without editing credentials.json.
+   * The credentials file itself is never modified.
+   *
+   * @param {Array<{type: string, path: string}>} entries - Discovered entries
+   * @returns {string[]} Account IDs that were newly added
+   */
+  addCredentialEntries(entries) {
+    const added = [];
+
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (!entry || !['json', 'sqlite'].includes(entry.type) || !entry.path) continue;
+
+      const resolved = path.resolve(expandUser(entry.path));
+      if (!fs.existsSync(resolved)) continue;
+      if (this._findCredsConfig(resolved)) continue;
+
+      this._credentialsConfig.push({ type: entry.type, path: resolved });
+      if (!this._accounts.has(resolved)) {
+        this._addAccount(resolved);
+        added.push(resolved);
+      }
+    }
+
+    return added;
+  }
+
+  /**
+   * Initializes the first account whose credentials still work. Accounts that
+   * fail are dropped from rotation so a dead credential source cannot keep
+   * failing lazily on every request.
+   *
+   * @param {string[]} [accountIds] - Candidate account IDs (defaults to all)
+   * @returns {Promise<string|null>} Initialized account ID, or null on failure
+   */
+  async initializeFirstWorking(accountIds = this.accountIds) {
+    for (const accountId of accountIds) {
+      logger.info(`Attempting to initialize account: ${accountId}`);
+
+      if (await this._initializeAccount(accountId)) {
+        logger.info(`Successfully initialized account: ${accountId}`);
+        return accountId;
+      }
+
+      this._accounts.delete(accountId);
+      logger.warning(`Failed to initialize account: ${accountId}`);
+    }
+
+    return null;
+  }
+
+  /**
    * Adds an account if it does not exist yet.
    *
    * @param {string} accountId - Account ID (path or token hash)

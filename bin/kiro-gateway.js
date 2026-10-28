@@ -486,25 +486,29 @@ async function main() {
     process.exit(1);
   }
 
-  // Initialize the first working account (blocking)
-  const allAccounts = accountManager.accountIds;
-  let initialized = false;
+  // Initialize the first working account (blocking). Configured credentials
+  // may be stale (for example an expired Kiro IDE token file), so fall back
+  // to auto-discovered local sources (kiro-cli database, Kiro IDE token file)
+  // before giving up.
+  let initialized = await accountManager.initializeFirstWorking();
 
-  for (let i = 0; i < allAccounts.length; i++) {
-    const accountId = allAccounts[i];
-    logger.info(`Attempting to initialize account: ${accountId}`);
+  if (!initialized) {
+    const { discoverDefaultCredentials } = require('../src/credentialDiscovery');
+    const fallbackIds = accountManager.addCredentialEntries(discoverDefaultCredentials());
 
-    const success = await accountManager._initializeAccount(accountId);
-    if (success) {
-      logger.info(`Successfully initialized account: ${accountId}`);
-      initialized = true;
-      break;
+    if (fallbackIds.length > 0) {
+      logger.info(
+        `Configured credentials failed, retrying with ${fallbackIds.length} auto-discovered source(s)`
+      );
+      initialized = await accountManager.initializeFirstWorking(fallbackIds);
     }
-    logger.warning(`Failed to initialize account: ${accountId}`);
   }
 
   if (!initialized) {
-    logger.error('Failed to initialize any account. Check your credentials.');
+    logger.error(
+      'Failed to initialize any account. Local Kiro credentials are missing or expired; ' +
+        'run `kiro-cli login` or sign in to Kiro IDE again, then restart the gateway.'
+    );
     process.exit(1);
   }
 
