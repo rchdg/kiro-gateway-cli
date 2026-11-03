@@ -885,3 +885,48 @@ test('withKeepalive does not drop a chunk that resolves during a keepalive tick'
 
   assert.deepEqual(real, ['one', 'two', 'three']);
 });
+
+test('streamKiroToOpenAI: a refusal with no content becomes an error chunk, not an empty reply', async () => {
+  // Kiro answers 200, sends the refusal metadata, and produces no text at all.
+  // Reporting that as finish_reason=content_filter let clients read it as a
+  // successful empty completion and re-send the identical request, which got
+  // refused again. It has to surface as a stream error.
+  const response = makeResponse([
+    buildEventChunk([
+      {
+        stopDetails: {
+          refusal: {
+            category: 'REASONING_EXTRACTION',
+            explanation: 'The selected model cannot continue this conversation.',
+          },
+        },
+        stopReason: 'CONTENT_FILTERED',
+      },
+      { contextUsagePercentage: 10 },
+    ]),
+  ]);
+
+  const chunks = [];
+  for await (const chunk of streamKiroToOpenAI(response, {
+    model: 'claude-sonnet-4.5',
+    modelCache: makeModelCache(),
+    authManager: makeDummyAuth(),
+  })) {
+    chunks.push(chunk);
+  }
+
+  const payloads = chunks
+    .filter((c) => c !== 'data: [DONE]\n\n')
+    .map((c) => JSON.parse(c.slice('data:'.length).trim()));
+
+  const error = payloads.find((p) => p.error);
+  assert.ok(error, 'expected an error chunk');
+  assert.match(error.error.message, /cannot continue/);
+
+  // No completion chunk may claim success.
+  assert.equal(
+    payloads.some((p) => Array.isArray(p.choices) && p.choices.length > 0),
+    false,
+    'a refused turn must not emit a completion chunk'
+  );
+});

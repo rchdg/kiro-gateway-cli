@@ -210,6 +210,29 @@ async function* streamKiroToOpenAIInternal(response, {
       });
     }
 
+    // A refusal with nothing to show is a failed turn, not an empty answer.
+    // `finish_reason: content_filter` plus `delta.refusal` is the OpenAI-shaped
+    // way to say so, but the common clients (AI SDK among them) read neither:
+    // they see a successful completion with no text, retry the identical
+    // payload, and get refused again. An error chunk is the only shape that
+    // reliably reaches the caller as a failure.
+    const refusalExplanation =
+      refusal &&
+      (refusal.explanation ||
+        `Upstream refused the turn (${refusal.category || refusal.stopReason || 'unknown'}).`);
+
+    if (refusal && !fullContent.trim() && allToolCalls.length === 0) {
+      logger.error(
+        `Refusal with no usable output (${refusal.category || refusal.stopReason || 'unknown'}); ` +
+          'reporting it as a stream error instead of an empty completion.'
+      );
+      yield formatOpenAISSE({
+        error: { message: refusalExplanation, type: 'kiro_api_error', code: 502 },
+      });
+      yield 'data: [DONE]\n\n';
+      return;
+    }
+
     // Final chunk with usage
     const finalChunk = {
       id: completionId,
@@ -225,10 +248,10 @@ async function* streamKiroToOpenAIInternal(response, {
     };
 
     // OpenAI carries refusals on delta.refusal; without it the client only sees
-    // a short answer and has no way to tell the turn was cut short.
+    // a short answer and has no way to tell the turn was cut short. Reached only
+    // when the refusal still left partial content worth returning.
     if (refusal) {
-      finalChunk.choices[0].delta.refusal =
-        refusal.explanation || `Upstream refused the turn (${refusal.category || refusal.stopReason}).`;
+      finalChunk.choices[0].delta.refusal = refusalExplanation;
     }
 
     if (meteringData) {
