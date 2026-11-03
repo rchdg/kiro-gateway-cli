@@ -381,6 +381,16 @@ function createServer({ accountManager, accountSystem = false }) {
             modelCache,
             requestMessages: messagesForTokenizer,
             requestTools: toolsForTokenizer,
+            // See the Anthropic twin: record the account as unhealthy so the
+            // next request picks a different one.
+            onStreamError: (err) =>
+              accountManager.reportFailure(
+                account.id,
+                model,
+                ErrorType.RECOVERABLE,
+                err.statusCode || 502,
+                null
+              ),
           });
         }
 
@@ -544,6 +554,17 @@ function createServer({ accountManager, accountSystem = false }) {
             requestMessages: messagesForTokenizer,
             requestTools: toolsForTokenizer,
             requestSystem: systemForTokenizer,
+            // A stream that dies mid-flight cannot fail over (the client is
+            // already reading a 200), but the account still has to be recorded
+            // as unhealthy or the circuit breaker never opens.
+            onStreamError: (err) =>
+              accountManager.reportFailure(
+                account.id,
+                model,
+                ErrorType.RECOVERABLE,
+                err.statusCode || 502,
+                null
+              ),
           });
         }
 
@@ -724,6 +745,7 @@ async function streamOpenAIResponse(res, ac, options) {
 
   let streamingError = null;
   let clientDisconnected = false;
+  const onError = typeof options.onStreamError === 'function' ? options.onStreamError : null;
 
   try {
     const chunks = withKeepalive(streamWithFirstTokenRetryOpenAI(options), {
@@ -742,6 +764,17 @@ async function streamOpenAIResponse(res, ac, options) {
     } else {
       streamingError = err;
       logger.error(`HTTP 500 - POST /v1/chat/completions (streaming) - ${err.message.slice(0, 100)}`);
+      // The 200 headers are long gone, so the request itself cannot failover.
+      // The account can still be marked unhealthy so the next request does:
+      // without this a persistent per-account failure never trips the circuit
+      // breaker and every subsequent request keeps hitting the same account.
+      if (onError) {
+        try {
+          await onError(err);
+        } catch (reportErr) {
+          logger.warning(`Failed to report streaming error to the account manager: ${reportErr.message}`);
+        }
+      }
       // The 200 headers are long gone, so the failure can only be reported
       // inside the stream. An error chunk is what OpenAI-compatible clients
       // read to surface the real reason; sending a bare [DONE] would look like
@@ -787,6 +820,7 @@ async function streamAnthropicResponse(res, ac, options) {
 
   let streamingError = null;
   let clientDisconnected = false;
+  const onError = typeof options.onStreamError === 'function' ? options.onStreamError : null;
 
   try {
     const chunks = withKeepalive(streamWithFirstTokenRetryAnthropic(options), {
@@ -805,6 +839,15 @@ async function streamAnthropicResponse(res, ac, options) {
     } else {
       streamingError = err;
       logger.error(`HTTP 500 - POST /v1/messages (streaming) - ${err.message.slice(0, 100)}`);
+      // Mark the account unhealthy so the next request can fail over; the
+      // current one already committed to a 200.
+      if (onError) {
+        try {
+          await onError(err);
+        } catch (reportErr) {
+          logger.warning(`Failed to report streaming error to the account manager: ${reportErr.message}`);
+        }
+      }
       // Send an error event to the client, then end the stream gracefully
       try {
         const errorEvent = `event: error\ndata: ${JSON.stringify({
