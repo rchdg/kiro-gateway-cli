@@ -24,6 +24,8 @@ const {
   BASE_RETRY_DELAY,
   FIRST_TOKEN_MAX_RETRIES,
   STREAMING_READ_TIMEOUT,
+  STREAMING_HEADERS_TIMEOUT,
+  STREAMING_BODY_TIMEOUT,
   VPN_PROXY_URL,
 } = require('./config');
 
@@ -43,6 +45,14 @@ const SOCKS_PROXY_SCHEMES = ['socks:', 'socks4:', 'socks4a:', 'socks5:', 'socks5
 // after the tunnel is established. undici's connectTimeout does not apply to
 // custom connectors, so without these a stalled proxy or handshake would
 // hang the request forever.
+//
+// This must be enforced by us, never by SocksProxyAgent's `timeout` option:
+// that option calls `socket.setTimeout()` and destroys the socket from a
+// `'timeout'` listener, which turns a *connect* budget into a permanent idle
+// timer on the established socket. Kiro answers with 200 headers immediately
+// and then may stay silent well past 10s before the first body chunk (prefill
+// plus reasoning on a large context), so that timer killed healthy requests
+// mid-stream with "Invalid EOF state" while Kiro was still working.
 const SOCKS_TUNNEL_TIMEOUT_MS = 10_000;
 
 // A single fast in-connect retry hides sub-second proxy blips (momentary
@@ -150,9 +160,14 @@ function resolveSocksPort(protocol, port) {
  *
  * @param {SocksProxyAgent} socksAgent - SocksProxyAgent for the tunnel
  * @param {number} [tlsHandshakeTimeoutMs] - TLS handshake timeout in ms
+ * @param {number} [connectTimeoutMs] - Budget for the whole connect phase in ms
  * @returns {Function} undici connect function (opts, callback)
  */
-function buildSocksConnect(socksAgent, tlsHandshakeTimeoutMs = SOCKS_TUNNEL_TIMEOUT_MS) {
+function buildSocksConnect(
+  socksAgent,
+  tlsHandshakeTimeoutMs = SOCKS_TUNNEL_TIMEOUT_MS,
+  connectTimeoutMs = SOCKS_TUNNEL_TIMEOUT_MS
+) {
   return (opts, callback) => {
     const isTls = opts.protocol === 'https:';
     const host = opts.hostname || opts.host;
@@ -199,11 +214,32 @@ function buildSocksConnect(socksAgent, tlsHandshakeTimeoutMs = SOCKS_TUNNEL_TIME
       socket.on('error', onError);
     };
 
+    // Guards only the connect phase. SocksProxyAgent's own `timeout` option
+    // cannot be used here: it installs a socket idle timer that survives the
+    // handshake and kills the connection on the first long silence from the
+    // model. This timer is cleared the moment the tunnel settles.
+    let timedOut = false;
+    const connectTimer = setTimeout(() => {
+      timedOut = true;
+      const err = new Error(`SOCKS tunnel timed out after ${connectTimeoutMs}ms`);
+      err.code = 'UND_ERR_CONNECT_TIMEOUT';
+      callback(err);
+    }, connectTimeoutMs);
+
     const attemptTunnel = (attempt) => {
       socksAgent
         .connect(_socksFakeReq, tunnelOpts)
-        .then(onTunnelEstablished)
+        .then((socket) => {
+          if (timedOut) {
+            // The request already failed; never leave this socket open.
+            socket.destroy();
+            return;
+          }
+          clearTimeout(connectTimer);
+          onTunnelEstablished(socket);
+        })
         .catch((err) => {
+          if (timedOut) return;
           // Only SOCKS tunnel failures land here. TLS handshake errors are
           // delivered through onTunnelEstablished's listeners and are never
           // retried (they are deterministic, e.g. certificate mismatches).
@@ -215,12 +251,30 @@ function buildSocksConnect(socksAgent, tlsHandshakeTimeoutMs = SOCKS_TUNNEL_TIME
             setTimeout(() => attemptTunnel(attempt + 1), SOCKS_TUNNEL_RETRY_DELAY_MS);
             return;
           }
+          clearTimeout(connectTimer);
           callback(err);
         });
     };
 
     attemptTunnel(0);
   };
+}
+
+/**
+ * Creates the SocksProxyAgent used by the SOCKS dispatcher.
+ *
+ * Deliberately built without a `timeout` option. socks-proxy-agent implements
+ * that option as `socket.setTimeout()` plus a `'timeout'` listener that
+ * destroys the socket, and never removes it once the tunnel is up. A connect
+ * budget therefore becomes a permanent idle timeout that severs a healthy
+ * streaming connection the moment the model is silent for longer than it —
+ * which is normal while prefill and reasoning run over a large context.
+ *
+ * @param {string} proxyUrl - SOCKS proxy URL (socks5h://, socks5://, ...)
+ * @returns {SocksProxyAgent} Agent with no socket idle timer
+ */
+function createSocksAgent(proxyUrl) {
+  return new SocksProxyAgent(proxyUrl);
 }
 
 /**
@@ -237,7 +291,7 @@ function buildSocksConnect(socksAgent, tlsHandshakeTimeoutMs = SOCKS_TUNNEL_TIME
  * @returns {undici.Agent} undici agent using the SOCKS tunnel
  */
 function createSocksDispatcher(proxyUrl, { tlsHandshakeTimeoutMs } = {}) {
-  const socksAgent = new SocksProxyAgent(proxyUrl, { timeout: SOCKS_TUNNEL_TIMEOUT_MS });
+  const socksAgent = createSocksAgent(proxyUrl);
   const agent = new undici.Agent({
     connect: buildSocksConnect(socksAgent, tlsHandshakeTimeoutMs),
   });
@@ -346,8 +400,12 @@ class KiroHttpClient {
           maxRedirections: 5,
           signal: signal || undefined,
           dispatcher: getProxyDispatcher() || undefined,
-          bodyTimeout: stream ? undefined : 300_000,
-          headersTimeout: stream ? undefined : 300_000,
+          // Streams used to pass `undefined` here, leaving a half-open socket
+          // free to hold the request forever. The values sit above the
+          // app-level first-token/read timeouts so those still produce the
+          // readable error; these only catch a socket that is truly dead.
+          bodyTimeout: stream ? STREAMING_BODY_TIMEOUT * 1000 : 300_000,
+          headersTimeout: stream ? STREAMING_HEADERS_TIMEOUT * 1000 : 300_000,
         };
 
         if (json !== null && json !== undefined) {
@@ -483,6 +541,7 @@ module.exports = {
   getProxyDispatcher,
   buildProxyDispatcher,
   buildSocksConnect,
+  createSocksAgent,
   createSocksDispatcher,
   resolveSocksPort,
   backoffDelaySeconds,

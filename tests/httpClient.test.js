@@ -13,6 +13,7 @@ const {
   getProxyDispatcher,
   buildProxyDispatcher,
   buildSocksConnect,
+  createSocksAgent,
   resolveSocksPort,
 } = require('../src/httpClient');
 
@@ -567,4 +568,58 @@ test('buildSocksConnect: retries the tunnel once on transient failure', async ()
   assert.equal(err, null);
   assert.equal(resolved, socket);
   assert.equal(attempts, 2);
+});
+
+// ==================================================================================================
+// buildSocksConnect - connect-phase timeout must not outlive the handshake
+// ==================================================================================================
+
+test('createSocksAgent: leaves no socket idle timer on established tunnel', () => {
+  const socksAgent = createSocksAgent('socks5h://127.0.0.1:1080');
+
+  // socks-proxy-agent turns a `timeout` option into socket.setTimeout() plus a
+  // 'timeout' listener that destroys the socket, and never removes it. On a
+  // streaming reply that is fatal: Kiro sends the 200 headers immediately and
+  // then goes quiet for the whole prefill/reasoning phase, so any idle budget
+  // here severs a healthy request mid-stream ("Invalid EOF state").
+  assert.equal(socksAgent.timeout, null);
+});
+
+test('buildSocksConnect: a settled tunnel is not destroyed after the connect timeout', async () => {
+  const socket = new FakeTlsSocket();
+  const agent = { connect: async () => socket };
+
+  // 20ms connect budget: short enough to observe the timer firing in a test.
+  const connect = buildSocksConnect(agent, undefined, 20);
+  const pending = invokeConnect(connect, {
+    hostname: 'localhost',
+    host: 'localhost',
+    protocol: 'http:',
+    port: 80,
+  });
+
+  const { err, socket: resolved } = await pending;
+  assert.equal(err, null);
+  assert.equal(resolved, socket);
+
+  // Wait past the connect budget. Before the fix the timer survived the
+  // handshake, so a silent stream was killed exactly this long after connect.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(socket.destroyed, false, 'connect timeout must not fire after the tunnel settled');
+});
+
+test('buildSocksConnect: connect timeout still fires when the tunnel never settles', async () => {
+  const agent = { connect: () => new Promise(() => {}) };
+
+  const connect = buildSocksConnect(agent, undefined, 20);
+  const { err, socket } = await invokeConnect(connect, {
+    hostname: 'localhost',
+    host: 'localhost',
+    protocol: 'http:',
+    port: 80,
+  });
+
+  assert.equal(err.code, 'UND_ERR_CONNECT_TIMEOUT');
+  assert.match(err.message, /SOCKS tunnel timed out/);
+  assert.equal(socket, undefined);
 });

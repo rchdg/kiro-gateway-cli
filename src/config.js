@@ -229,6 +229,15 @@ const FIRST_TOKEN_TIMEOUT = envFloat('FIRST_TOKEN_TIMEOUT', 90);
 const STREAMING_READ_TIMEOUT = envFloat('STREAMING_READ_TIMEOUT', 300);
 const FIRST_TOKEN_MAX_RETRIES = envInt('FIRST_TOKEN_MAX_RETRIES', 3);
 
+// undici guards for streaming requests. Both were previously disabled
+// (undefined) for streams, which left a half-open socket able to hold a
+// request open forever once the SOCKS layer stopped enforcing an idle timeout.
+// They are deliberately set above the app-level limits so the readable
+// FirstTokenTimeout/ReadTimeout errors fire first and only a genuinely dead
+// socket reaches these. Set either to 0 to disable.
+const STREAMING_HEADERS_TIMEOUT = envFloat('STREAMING_HEADERS_TIMEOUT', 120);
+const STREAMING_BODY_TIMEOUT = envFloat('STREAMING_BODY_TIMEOUT', STREAMING_READ_TIMEOUT + 30);
+
 // Clients watch the response body for silence and abort when nothing arrives
 // for a while (min-agent gives up after 90s, for example). The gateway is
 // legitimately silent for long stretches - while waiting for the first token,
@@ -336,6 +345,8 @@ module.exports = {
   FAKE_REASONING_INITIAL_BUFFER_SIZE,
   FIRST_TOKEN_TIMEOUT,
   STREAMING_READ_TIMEOUT,
+  STREAMING_HEADERS_TIMEOUT,
+  STREAMING_BODY_TIMEOUT,
   FIRST_TOKEN_MAX_RETRIES,
   STREAM_KEEPALIVE_INTERVAL,
   MAX_REQUEST_BODY_SIZE,
